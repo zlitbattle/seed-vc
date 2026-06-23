@@ -64,8 +64,7 @@ style_encoder:
   embedding_size: 192
 content_extractor_narrow:
   _target_: modules.astral_quantization.default_model.AstralQuantizer
-  tokenizer_name: "openai/whisper-small"
-  ssl_model_name: "facebook/hubert-large-ll60k"
+  ssl_model_name: "models/hubert-large-ll60k"
   ssl_output_layer: 18
   skip_ssl: true
   encoder: &bottleneck_encoder
@@ -86,8 +85,7 @@ content_extractor_narrow:
     soft_entropy_loss: True
 content_extractor_wide:
   _target_: modules.astral_quantization.default_model.AstralQuantizer
-  tokenizer_name: "openai/whisper-small"
-  ssl_model_name: "facebook/hubert-large-ll60k"
+  ssl_model_name: "models/hubert-large-ll60k"
   ssl_output_layer: 18
   encoder: *bottleneck_encoder
   quantizer:
@@ -101,5 +99,5 @@ content_extractor_wide:
     soft_entropy_loss: True
 vocoder:
   _target_: modules.bigvgan.bigvgan.BigVGAN.from_pretrained
-  pretrained_model_name_or_path: "nvidia/bigvgan_v2_22khz_80band_256x"
+  pretrained_model_name_or_path: "models/bigvgan_v2_22khz_80band_256x"
   use_cuda_kernel: false

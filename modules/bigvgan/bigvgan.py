@@ -4,10 +4,8 @@
 # Adapted from https://github.com/jik876/hifi-gan under the MIT license.
 #   LICENSE is in incl_licenses directory.
 
-import os
 import json
 from pathlib import Path
-from typing import Optional, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -18,8 +16,6 @@ from . import activations
 from .utils import init_weights, get_padding
 from .alias_free_activation.torch.act import Activation1d as TorchActivation1d
 from .env import AttrDict
-
-from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
 
 def load_hparams_from_json(path) -> AttrDict:
@@ -240,16 +236,7 @@ class AMPBlock2(torch.nn.Module):
             remove_weight_norm(l)
 
 
-class BigVGAN(
-    torch.nn.Module,
-    PyTorchModelHubMixin,
-    library_name="bigvgan",
-    repo_url="https://github.com/NVIDIA/BigVGAN",
-    docs_url="https://github.com/NVIDIA/BigVGAN/blob/main/README.md",
-    pipeline_tag="audio-to-audio",
-    license="mit",
-    tags=["neural-vocoder", "audio-generation", "arxiv:2206.04658"],
-):
+class BigVGAN(torch.nn.Module):
     """
     BigVGAN is a neural vocoder model that applies anti-aliased periodic activation for residual blocks (resblocks).
     New in BigVGAN-v2: it can optionally use optimized CUDA kernels for AMP (anti-aliased multi-periodicity) blocks.
@@ -399,55 +386,33 @@ class BigVGAN(
             print("[INFO] Model already removed weight norm. Skipping!")
             pass
 
-    # Additional methods for huggingface_hub support
-    def _save_pretrained(self, save_directory: Path) -> None:
-        """Save weights and config.json from a Pytorch model to a local directory."""
-
-        model_path = save_directory / "bigvgan_generator.pt"
-        torch.save({"generator": self.state_dict()}, model_path)
-
-        config_path = save_directory / "config.json"
-        with open(config_path, "w") as config_file:
-            json.dump(self.h, config_file, indent=4)
-
     @classmethod
-    def _from_pretrained(
-            cls,
-            *,
-            model_id: str,
-            revision: str,
-            cache_dir: str,
-            force_download: bool,
-            proxies: Optional[Dict],
-            resume_download: bool,
-            local_files_only: bool,
-            token: Union[str, bool, None],
-            map_location: str = "cpu",  # Additional argument
-            strict: bool = False,  # Additional argument
-            use_cuda_kernel: bool = False,
-            **model_kwargs,
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        map_location: str = "cpu",
+        use_cuda_kernel: bool = False,
+        **model_kwargs,
     ):
-        """Load Pytorch pretrained weights and return the loaded model."""
+        """Load BigVGAN from a local directory containing config.json and bigvgan_generator.pt."""
 
-        # Download and load hyperparameters (h) used by BigVGAN
-        if os.path.isdir(model_id):
-            print("Loading config.json from local directory")
-            config_file = os.path.join(model_id, "config.json")
-        else:
-            config_file = hf_hub_download(
-                repo_id=model_id,
-                filename="config.json",
-                revision=revision,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                proxies=proxies,
-                resume_download=resume_download,
-                token=token,
-                local_files_only=local_files_only,
+        model_dir = Path(pretrained_model_name_or_path).expanduser()
+        if not model_dir.is_dir():
+            raise FileNotFoundError(
+                f"BigVGAN model directory not found: {model_dir}. "
+                "Prepare local model files first, for example with scripts/download_models.py."
             )
+
+        config_file = model_dir / "config.json"
+        model_file = model_dir / "bigvgan_generator.pt"
+        if not config_file.is_file():
+            raise FileNotFoundError(f"BigVGAN config not found: {config_file}")
+        if not model_file.is_file():
+            raise FileNotFoundError(f"BigVGAN weights not found: {model_file}")
+
+        print(f"Loading BigVGAN config from {config_file}")
         h = load_hparams_from_json(config_file)
 
-        # instantiate BigVGAN using h
         if use_cuda_kernel:
             print(
                 f"[WARNING] You have specified use_cuda_kernel=True during BigVGAN.from_pretrained(). Only inference is supported (training is not implemented)!"
@@ -460,24 +425,7 @@ class BigVGAN(
             )
         model = cls(h, use_cuda_kernel=use_cuda_kernel)
 
-        # Download and load pretrained generator weight
-        if os.path.isdir(model_id):
-            print("Loading weights from local directory")
-            model_file = os.path.join(model_id, "bigvgan_generator.pt")
-        else:
-            print(f"Loading weights from {model_id}")
-            model_file = hf_hub_download(
-                repo_id=model_id,
-                filename="bigvgan_generator.pt",
-                revision=revision,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                proxies=proxies,
-                resume_download=resume_download,
-                token=token,
-                local_files_only=local_files_only,
-            )
-
+        print(f"Loading BigVGAN weights from {model_file}")
         checkpoint_dict = torch.load(model_file, map_location=map_location)
 
         try:

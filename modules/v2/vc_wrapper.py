@@ -2,19 +2,16 @@ import torch
 import librosa
 import torchaudio
 import numpy as np
+from pathlib import Path
 from pydub import AudioSegment
-from hf_utils import load_custom_model_from_hf
 
-DEFAULT_REPO_ID = "Plachta/Seed-VC"
-DEFAULT_CFM_CHECKPOINT = "v2/cfm_small.pth"
-DEFAULT_AR_CHECKPOINT = "v2/ar_base.pth"
+DEFAULT_MODEL_DIR = Path("models")
 
-DEFAULT_CE_REPO_ID = "Plachta/ASTRAL-quantization"
-DEFAULT_CE_NARROW_CHECKPOINT = "bsq32/bsq32_light.pth"
-DEFAULT_CE_WIDE_CHECKPOINT = "bsq2048/bsq2048_light.pth"
-
-DEFAULT_SE_REPO_ID = "funasr/campplus"
-DEFAULT_SE_CHECKPOINT = "campplus_cn_common.bin"
+DEFAULT_CFM_CHECKPOINT = DEFAULT_MODEL_DIR / "seed-vc-v2" / "cfm_small.pth"
+DEFAULT_AR_CHECKPOINT = DEFAULT_MODEL_DIR / "seed-vc-v2" / "ar_base.pth"
+DEFAULT_CE_NARROW_CHECKPOINT = DEFAULT_MODEL_DIR / "astral-quantization" / "bsq32" / "bsq32_light.pth"
+DEFAULT_CE_WIDE_CHECKPOINT = DEFAULT_MODEL_DIR / "astral-quantization" / "bsq2048" / "bsq2048_light.pth"
+DEFAULT_SE_CHECKPOINT = DEFAULT_MODEL_DIR / "campplus" / "campplus_cn_common.bin"
 
 class VoiceConversionWrapper(torch.nn.Module):
     def __init__(
@@ -252,21 +249,37 @@ class VoiceConversionWrapper(torch.nn.Module):
             self,
             cfm_checkpoint_path = None,
             ar_checkpoint_path = None,
+            content_extractor_narrow_checkpoint_path = None,
+            content_extractor_wide_checkpoint_path = None,
+            style_encoder_checkpoint_path = None,
     ):
-        if cfm_checkpoint_path is None:
-            cfm_checkpoint_path = load_custom_model_from_hf(
-                repo_id=DEFAULT_REPO_ID,
-                model_filename=DEFAULT_CFM_CHECKPOINT,
-            )
-        else:
-            print(f"Loading CFM checkpoint from {cfm_checkpoint_path}...")
-        if ar_checkpoint_path is None:
-            ar_checkpoint_path = load_custom_model_from_hf(
-                repo_id=DEFAULT_REPO_ID,
-                model_filename=DEFAULT_AR_CHECKPOINT,
-            )
-        else:
-            print(f"Loading AR checkpoint from {ar_checkpoint_path}...")
+        cfm_checkpoint_path = self._resolve_local_checkpoint(
+            cfm_checkpoint_path or DEFAULT_CFM_CHECKPOINT,
+            "CFM checkpoint",
+        )
+        ar_checkpoint_path = self._resolve_local_checkpoint(
+            ar_checkpoint_path or DEFAULT_AR_CHECKPOINT,
+            "AR checkpoint",
+        )
+        content_extractor_narrow_checkpoint_path = self._resolve_local_checkpoint(
+            content_extractor_narrow_checkpoint_path or DEFAULT_CE_NARROW_CHECKPOINT,
+            "narrow content extractor checkpoint",
+        )
+        content_extractor_wide_checkpoint_path = self._resolve_local_checkpoint(
+            content_extractor_wide_checkpoint_path or DEFAULT_CE_WIDE_CHECKPOINT,
+            "wide content extractor checkpoint",
+        )
+        style_encoder_checkpoint_path = self._resolve_local_checkpoint(
+            style_encoder_checkpoint_path or DEFAULT_SE_CHECKPOINT,
+            "style encoder checkpoint",
+        )
+
+        print(f"Loading CFM checkpoint from {cfm_checkpoint_path}...")
+        print(f"Loading AR checkpoint from {ar_checkpoint_path}...")
+        print(f"Loading narrow content extractor checkpoint from {content_extractor_narrow_checkpoint_path}...")
+        print(f"Loading wide content extractor checkpoint from {content_extractor_wide_checkpoint_path}...")
+        print(f"Loading style encoder checkpoint from {style_encoder_checkpoint_path}...")
+
         # cfm
         cfm_checkpoint = torch.load(cfm_checkpoint_path, map_location="cpu")
         cfm_length_regulator_state_dict = self.strip_prefix(cfm_checkpoint["net"]['length_regulator'], "module.")
@@ -282,28 +295,29 @@ class VoiceConversionWrapper(torch.nn.Module):
         missing_keys, unexpected_keys = self.ar_length_regulator.load_state_dict(ar_length_regulator_state_dict, strict=False)
 
         # content extractor
-        content_extractor_narrow_checkpoint_path = load_custom_model_from_hf(
-            repo_id=DEFAULT_CE_REPO_ID,
-            model_filename=DEFAULT_CE_NARROW_CHECKPOINT,
-        )
         content_extractor_narrow_checkpoint = torch.load(content_extractor_narrow_checkpoint_path, map_location="cpu")
         self.content_extractor_narrow.load_state_dict(
             content_extractor_narrow_checkpoint, strict=False
         )
 
-        content_extractor_wide_checkpoint_path = load_custom_model_from_hf(
-            repo_id=DEFAULT_CE_REPO_ID,
-            model_filename=DEFAULT_CE_WIDE_CHECKPOINT,
-        )
         content_extractor_wide_checkpoint = torch.load(content_extractor_wide_checkpoint_path, map_location="cpu")
         self.content_extractor_wide.load_state_dict(
             content_extractor_wide_checkpoint, strict=False
         )
 
         # style encoder
-        style_encoder_checkpoint_path = load_custom_model_from_hf(DEFAULT_SE_REPO_ID, DEFAULT_SE_CHECKPOINT, config_filename=None)
         style_encoder_checkpoint = torch.load(style_encoder_checkpoint_path, map_location="cpu")
         self.style_encoder.load_state_dict(style_encoder_checkpoint, strict=False)
+
+    @staticmethod
+    def _resolve_local_checkpoint(path, label: str) -> Path:
+        checkpoint_path = Path(path).expanduser()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"{label} not found: {checkpoint_path}. "
+                "Prepare local model files first, for example with scripts/download_models.py."
+            )
+        return checkpoint_path
 
     def setup_ar_caches(self, max_batch_size=1, max_seq_len=4096, dtype=torch.float32, device=torch.device("cpu")):
         self.ar.setup_caches(max_batch_size=max_batch_size, max_seq_len=max_seq_len, dtype=dtype, device=device)

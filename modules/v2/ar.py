@@ -5,7 +5,7 @@ from collections import OrderedDict
 from functools import partial, wraps
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Sequence, Union
 from tqdm import tqdm
 
 import torch
@@ -81,16 +81,40 @@ class KVCache(nn.Module):
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val):
+    def update(self, input_pos, k_val, v_val, slot_ids: Optional[Union[Tensor, Sequence[int]]] = None):
         # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
+        if input_pos.dim() == 1:
+            assert input_pos.shape[0] == k_val.shape[2]
+        else:
+            assert input_pos.shape[0] == k_val.shape[0]
+            assert input_pos.shape[1] == k_val.shape[2]
 
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
 
-        return k_out, v_out
+        if slot_ids is None:
+            if input_pos.dim() == 1:
+                k_out[:k_val.size(0), :, input_pos] = k_val
+                v_out[:v_val.size(0), :, input_pos] = v_val
+            else:
+                for batch_idx in range(k_val.size(0)):
+                    positions = input_pos[batch_idx]
+                    k_out[batch_idx, :, positions] = k_val[batch_idx]
+                    v_out[batch_idx, :, positions] = v_val[batch_idx]
+            return k_out[:k_val.size(0)], v_out[:v_val.size(0)]
+
+        if not torch.is_tensor(slot_ids):
+            slot_ids = torch.tensor(slot_ids, device=k_val.device, dtype=torch.long)
+        else:
+            slot_ids = slot_ids.to(device=k_val.device, dtype=torch.long)
+        assert slot_ids.numel() == k_val.size(0)
+
+        for batch_idx, slot_id in enumerate(slot_ids.tolist()):
+            positions = input_pos if input_pos.dim() == 1 else input_pos[batch_idx]
+            k_out[slot_id, :, positions] = k_val[batch_idx]
+            v_out[slot_id, :, positions] = v_val[batch_idx]
+
+        return k_out[slot_ids], v_out[slot_ids]
 
 
 @dataclass
@@ -208,6 +232,8 @@ class BaseTransformer(nn.Module):
             freqs_cis = self.freqs_cis[:seq_len].repeat(inp.size(0), 1, 1, 1)
         else:
             freqs_cis = self.freqs_cis[input_pos]
+            if input_pos.dim() == 1:
+                freqs_cis = freqs_cis.unsqueeze(0).expand(inp.size(0), -1, -1, -1)
 
         # Not that the causal mask here follows the definition of scaled_dot_product_attention
         # That is, FALSE means masked out
@@ -242,17 +268,24 @@ class BaseTransformer(nn.Module):
         input_pos: Optional[Tensor] = None,
         kv_pos: Optional[Tensor] = None,
         return_all: bool = False,
+        slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
     ) -> BaseTransformerForwardResult:
         # This is used for generation, optimized for torch compile
 
         x = inp
         max_seq_len = self.max_seq_len
 
-        mask = self.causal_mask[None, None, kv_pos, :max_seq_len]  # (B, N, Q, K)
+        mask = self.causal_mask[kv_pos, :max_seq_len]
+        if kv_pos.dim() == 1:
+            mask = mask[None, None]  # (1, 1, Q, K), broadcastable to batch
+        else:
+            mask = mask[:, None]  # (B, 1, Q, K)
         freqs_cis = self.freqs_cis[input_pos]
+        if input_pos.dim() == 1:
+            freqs_cis = freqs_cis.unsqueeze(0).expand(inp.size(0), -1, -1, -1)
 
         for layer in self.layers:
-            x = layer(x, freqs_cis, mask, input_pos=kv_pos)
+            x = layer(x, freqs_cis, mask, input_pos=kv_pos, slot_ids=slot_ids)
 
         x = x[:, -1:]
 
@@ -323,8 +356,9 @@ class NaiveTransformer(BaseTransformer):
         input_pos: Optional[Tensor] = None,
         kv_pos: Optional[Tensor] = None,
         vq_masks: Optional[Tensor] = None,
+        slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
     ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos, kv_pos, vq_masks)
+        x = super().forward_generate(x, input_pos, kv_pos, vq_masks, slot_ids=slot_ids)
         return x
 
 class NaiveWrapper(nn.Module):
@@ -421,6 +455,62 @@ class NaiveWrapper(nn.Module):
             emb_seq = torch.cat([emb_seq, new_emb], dim=1)
         return torch.stack(pred_codes, dim=-1)
 
+    def build_generation_inputs(self, prompt_text: Tensor, prompt_target: Tensor):
+        """Build the exact prefill tensors used by generate()."""
+        sep_token_emb = self.sep_token_emb.expand(prompt_text.size(0), 1, -1)
+        emb_seq = torch.cat([sep_token_emb, prompt_text, sep_token_emb], dim=1)
+        input_pos = torch.arange(prompt_text.size(1) + 1, device=emb_seq.device)
+        input_pos = torch.cat([input_pos, torch.LongTensor([0]).to(emb_seq.device)])
+        prompt_target_emb = self.model.embed_base(
+            prompt_target,
+            torch.LongTensor([prompt_target.size(1)]).to(prompt_target.device),
+        )[1]
+        emb_seq = torch.cat([emb_seq, prompt_target_emb], dim=1)
+        input_pos = torch.cat([input_pos, torch.arange(prompt_target_emb.size(1)).to(input_pos.device) + 1])
+        kv_pos = torch.arange(emb_seq.size(1), device=emb_seq.device)
+        return emb_seq, input_pos, kv_pos
+
+    def embed_generated_token(self, token: Tensor) -> Tensor:
+        if token.dim() == 0:
+            token = token[None]
+        token = token.long()
+        return self.model.embed_base(token.unsqueeze(0), torch.LongTensor([1]).to(token.device))[1]
+
+    def decode_one_token_ar_batch(
+            self,
+            x: torch.Tensor,
+            input_pos: torch.Tensor,
+            kv_pos: torch.Tensor,
+            slot_ids: Union[Tensor, Sequence[int]],
+            previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
+            suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+            **sampling_kwargs,
+    ) -> torch.Tensor:
+        result = self.model.forward_generate(x, input_pos, kv_pos, slot_ids=slot_ids)
+        sampled_tokens = []
+        for batch_idx in range(result.logits.size(0)):
+            prev = None
+            if previous_tokens is not None:
+                prev = previous_tokens[batch_idx]
+
+            row_sampling_kwargs = sampling_kwargs.copy()
+            row_suppress_tokens = None
+            if suppress_tokens is not None:
+                row_suppress_tokens = suppress_tokens[batch_idx]
+            elif "suppress_tokens" in row_sampling_kwargs:
+                row_suppress_tokens = row_sampling_kwargs.pop("suppress_tokens")
+
+            if row_suppress_tokens is not None:
+                row_sampling_kwargs["suppress_tokens"] = row_suppress_tokens
+
+            sampled, _ = sample(
+                result.logits[batch_idx:batch_idx + 1],
+                previous_tokens=prev,
+                **row_sampling_kwargs,
+            )
+            sampled_tokens.append(sampled.reshape(()))
+        return torch.stack(sampled_tokens, dim=0)
+
     def decode_one_token_ar(
             self,
             x: torch.Tensor,
@@ -428,12 +518,13 @@ class NaiveWrapper(nn.Module):
             kv_pos: torch.Tensor,
             previous_tokens: torch.Tensor = None,
             compiled_decode_fn = None,
+            slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
             **sampling_kwargs,
     ) -> torch.Tensor:
-        if compiled_decode_fn is not None:
+        if compiled_decode_fn is not None and slot_ids is None:
             x = compiled_decode_fn(x, input_pos, kv_pos)
         else:
-            x = self.model.forward_generate(x, input_pos, kv_pos)
+            x = self.model.forward_generate(x, input_pos, kv_pos, slot_ids=slot_ids)
 
         sampling_kwargs_main = sampling_kwargs.copy()
         codebooks = [
@@ -457,9 +548,14 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(
-        self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Tensor = None
+        self,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        input_pos: Tensor = None,
+        slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
     ) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, slot_ids=slot_ids)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -506,6 +602,7 @@ class Attention(nn.Module):
         freqs_cis: Tensor,
         mask: Tensor,
         input_pos: Optional[Tensor] = None,
+        slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -530,7 +627,7 @@ class Attention(nn.Module):
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            k, v = self.kv_cache.update(input_pos, k, v, slot_ids=slot_ids)
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)

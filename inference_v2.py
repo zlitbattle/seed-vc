@@ -4,6 +4,7 @@ import torch
 import yaml
 import soundfile as sf
 import time
+from pathlib import Path
 from modules.commons import str2bool
 
 # Set up device and torch configurations
@@ -24,10 +25,22 @@ def load_v2_models(args):
     """Load V2 models using the wrapper from app.py"""
     from hydra.utils import instantiate
     from omegaconf import DictConfig
+    model_dir = Path(args.model_dir)
     cfg = DictConfig(yaml.safe_load(open("configs/v2/vc_wrapper.yaml", "r")))
     vc_wrapper = instantiate(cfg)
-    vc_wrapper.load_checkpoints(ar_checkpoint_path=args.ar_checkpoint_path,
-                                cfm_checkpoint_path=args.cfm_checkpoint_path)
+    vc_wrapper.load_checkpoints(
+        ar_checkpoint_path=args.ar_checkpoint_path or model_dir / "seed-vc-v2" / "ar_base.pth",
+        cfm_checkpoint_path=args.cfm_checkpoint_path or model_dir / "seed-vc-v2" / "cfm_small.pth",
+        content_extractor_narrow_checkpoint_path=(
+            args.content_extractor_narrow_checkpoint_path
+            or model_dir / "astral-quantization" / "bsq32" / "bsq32_light.pth"
+        ),
+        content_extractor_wide_checkpoint_path=(
+            args.content_extractor_wide_checkpoint_path
+            or model_dir / "astral-quantization" / "bsq2048" / "bsq2048_light.pth"
+        ),
+        style_encoder_checkpoint_path=args.style_encoder_checkpoint_path or model_dir / "campplus" / "campplus_cn_common.bin",
+    )
     vc_wrapper.to(device)
     vc_wrapper.eval()
 
@@ -117,6 +130,8 @@ if __name__ == "__main__":
                         help="Length adjustment factor (<1.0 for speed-up, >1.0 for slow-down)")
     parser.add_argument("--compile", type=bool, default=False,
                         help="Whether to compile the model for faster inference")
+    parser.add_argument("--model-dir", type=str, default="models",
+                        help="Directory containing local offline model files")
 
     # V2 specific arguments
     parser.add_argument("--intelligibility-cfg-rate", type=float, default=0.7,
@@ -139,6 +154,12 @@ if __name__ == "__main__":
                         help="Path to custom checkpoint file")
     parser.add_argument("--cfm-checkpoint-path", type=str, default=None,
                         help="Path to custom checkpoint file")
+    parser.add_argument("--content-extractor-narrow-checkpoint-path", type=str, default=None,
+                        help="Path to local narrow content extractor checkpoint")
+    parser.add_argument("--content-extractor-wide-checkpoint-path", type=str, default=None,
+                        help="Path to local wide content extractor checkpoint")
+    parser.add_argument("--style-encoder-checkpoint-path", type=str, default=None,
+                        help="Path to local style encoder checkpoint")
 
     args = parser.parse_args()
     main(args)
