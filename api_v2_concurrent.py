@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
 from functools import lru_cache
 import platform
 import re
@@ -88,6 +89,21 @@ class ConvertRequest(BaseModel):
     anonymization_only: bool = False
 
 
+service: Optional[ConcurrentVoiceConversionService] = None
+server_args = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if server_args is not None:
+        await initialize_service(server_args)
+    try:
+        yield
+    finally:
+        if service is not None:
+            await service.stop()
+
+
 class ConvertResponse(BaseModel):
     request_id: str
     output_path: str
@@ -96,21 +112,7 @@ class ConvertResponse(BaseModel):
     elapsed_sec: float
 
 
-app = FastAPI(title="Seed-VC V2 Concurrent API", version="0.1.0")
-service: Optional[ConcurrentVoiceConversionService] = None
-server_args = None
-
-
-@app.on_event("startup")
-async def startup_event():
-    if server_args is not None:
-        await initialize_service(server_args)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if service is not None:
-        await service.stop()
+app = FastAPI(title="Seed-VC V2 Concurrent API", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
