@@ -48,6 +48,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         self.dit_max_context_len = 30  # in seconds
         self.ar_max_content_len = 1500  # in num of narrow tokens
         self.compile_len = 87 * self.dit_max_context_len
+        self.cfm_compile_buckets = self._build_cfm_compile_buckets(self.compile_len)
 
     def forward_cfm(self, content_indices_wide, content_lens, mels, mel_lens, style_vectors):
         device = content_indices_wide.device
@@ -118,6 +119,19 @@ class VoiceConversionWrapper(torch.nn.Module):
             mode="reduce-overhead" if torch.cuda.is_available() else None,
         )
         self.dit_compiled = True
+
+    @staticmethod
+    def _build_cfm_compile_buckets(compile_len: int) -> tuple[int, ...]:
+        buckets = (1024, 1280, 1536, 1792, 2048, 2304, compile_len)
+        return tuple(dict.fromkeys(bucket for bucket in buckets if bucket <= compile_len))
+
+    def select_cfm_compile_bucket(self, condition_len: int) -> int:
+        for bucket_len in self.cfm_compile_buckets:
+            if condition_len <= bucket_len:
+                return bucket_len
+        raise RuntimeError(
+            f"CFM condition length {condition_len} exceeds max compile bucket {self.cfm_compile_buckets[-1]}"
+        )
 
     @staticmethod
     def strip_prefix(state_dict: dict, prefix: str = "module.") -> dict:
@@ -615,10 +629,10 @@ class VoiceConversionWrapper(torch.nn.Module):
                     chunk_cond, _ = self.cfm_length_regulator(chunk_ar_out, ylens=torch.LongTensor([chunkar_out_mel_len]).to(device))
                     cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
                     original_len = cat_condition.size(1)
-                    # pad cat_condition to compile_len
                     if self.dit_compiled:
+                        compile_bucket_len = self.select_cfm_compile_bucket(original_len)
                         cat_condition = torch.nn.functional.pad(cat_condition,
-                                                                (0, 0, 0, self.compile_len - cat_condition.size(1),),
+                                                                (0, 0, 0, compile_bucket_len - original_len),
                                                                 value=0)
                     # Voice Conversion
                     vc_mel = self.cfm.inference(
@@ -651,10 +665,10 @@ class VoiceConversionWrapper(torch.nn.Module):
                 is_last_chunk = processed_frames + max_source_window >= cond.size(1)
                 cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
                 original_len = cat_condition.size(1)
-                # pad cat_condition to compile_len
                 if self.dit_compiled:
+                    compile_bucket_len = self.select_cfm_compile_bucket(original_len)
                     cat_condition = torch.nn.functional.pad(cat_condition,
-                                                            (0, 0, 0, self.compile_len - cat_condition.size(1),), value=0)
+                                                            (0, 0, 0, compile_bucket_len - original_len), value=0)
                 with torch.autocast(device_type=device.type, dtype=torch.float32):  # force CFM to use float32
                     # Voice Conversion
                     vc_mel = self.cfm.inference(

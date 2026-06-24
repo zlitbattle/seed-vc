@@ -447,7 +447,7 @@ class CFMScheduler:
                 chunk_cond, _ = self.vc_wrapper.cfm_length_regulator(ar_out, ylens=ar_out_mel_len)
                 cat_condition = torch.cat([timbre.prompt_condition, chunk_cond], dim=1)
                 original_len = cat_condition.size(1)
-                vc_mel = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
+                vc_mel, _, _ = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
             vc_mel = vc_mel[:, :, timbre.target_mel_len:original_len]
             vc_wave = self.vc_wrapper.vocoder(vc_mel).squeeze()[None]
             processed_frames, previous_chunk, should_break, _, full_audio = self.vc_wrapper._stream_wave_chunks(
@@ -483,7 +483,11 @@ class CFMScheduler:
             cfm_started_at = time.perf_counter()
             synchronize_device(self.device)
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                vc_mel = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
+                vc_mel, compile_bucket_len, compile_pad_frames = self._infer_cfm(
+                    job,
+                    cat_condition,
+                    random_voice=job.params.anonymization_only,
+                )
             synchronize_device(self.device)
             cfm_infer_sec = time.perf_counter() - cfm_started_at
             original_len = condition_len
@@ -510,7 +514,8 @@ class CFMScheduler:
                 (
                     "request=%s stage=cfm_chunk_done chunk=%s chunk_sec=%.3f "
                     "cfm_infer_sec=%.3f vocoder_sec=%.3f stream_cpu_sec=%.3f "
-                    "condition_len=%s source_chunk_len=%s output_mel_len=%s last=%s"
+                    "condition_len=%s compile_bucket_len=%s compile_pad_frames=%s "
+                    "source_chunk_len=%s output_mel_len=%s last=%s"
                 ),
                 job.request_id,
                 chunk_index,
@@ -519,6 +524,8 @@ class CFMScheduler:
                 vocoder_sec,
                 stream_cpu_sec,
                 condition_len,
+                compile_bucket_len,
+                compile_pad_frames,
                 chunk_cond.size(1),
                 vc_mel.size(2),
                 is_last_chunk,
@@ -529,16 +536,20 @@ class CFMScheduler:
 
         return self.vc_wrapper.sr, np.concatenate(generated_wave_chunks)
 
-    def _infer_cfm(self, job: CFMJob, cat_condition: torch.Tensor, random_voice: bool) -> torch.Tensor:
+    def _infer_cfm(self, job: CFMJob, cat_condition: torch.Tensor, random_voice: bool) -> Tuple[torch.Tensor, int, int]:
         original_len = cat_condition.size(1)
+        compile_bucket_len = original_len
+        compile_pad_frames = 0
         if self.vc_wrapper.dit_compiled:
+            compile_bucket_len = self.vc_wrapper.select_cfm_compile_bucket(original_len)
+            compile_pad_frames = compile_bucket_len - original_len
             cat_condition = torch.nn.functional.pad(
                 cat_condition,
-                (0, 0, 0, self.vc_wrapper.compile_len - cat_condition.size(1)),
+                (0, 0, 0, compile_pad_frames),
                 value=0,
             )
         timbre = job.timbre_features
-        return self.vc_wrapper.cfm.inference(
+        vc_mel = self.vc_wrapper.cfm.inference(
             cat_condition,
             torch.LongTensor([original_len]).to(self.device),
             timbre.target_mel,
@@ -547,6 +558,7 @@ class CFMScheduler:
             inference_cfg_rate=[job.params.intelligibility_cfg_rate, job.params.similarity_cfg_rate],
             random_voice=random_voice,
         )
+        return vc_mel, compile_bucket_len, compile_pad_frames
 
     def metrics(self) -> Dict[str, int]:
         return {
