@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import time
 import uuid
 from collections import OrderedDict
@@ -10,6 +11,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import librosa
 import numpy as np
 import torch
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,7 +74,7 @@ class CFMJob:
     timbre_features: TimbreFeatures
     ar_outputs: Optional[List[torch.Tensor]] = None
     future: Optional[asyncio.Future] = None
-    submitted_at: float = field(default_factory=time.time)
+    submitted_at: float = field(default_factory=time.perf_counter)
 
 
 class TimbreFeatureCache:
@@ -341,6 +345,13 @@ class CFMScheduler:
 
     async def submit(self, job: CFMJob) -> Tuple[int, np.ndarray]:
         job.future = asyncio.get_running_loop().create_future()
+        logger.info(
+            "request=%s stage=cfm_queue_submit queue_size=%s active=%s max_concurrent=%s",
+            job.request_id,
+            self.queue.qsize(),
+            self.active,
+            self.max_concurrent,
+        )
         await self.queue.put(job)
         return await job.future
 
@@ -348,15 +359,35 @@ class CFMScheduler:
         while self._running:
             job = await self.queue.get()
             self.active += 1
+            queue_wait_sec = time.perf_counter() - job.submitted_at
+            run_started_at = time.perf_counter()
+            logger.info(
+                "request=%s stage=cfm_start queue_wait_sec=%.3f active=%s queue_size=%s",
+                job.request_id,
+                queue_wait_sec,
+                self.active,
+                self.queue.qsize(),
+            )
             try:
                 result = await asyncio.to_thread(self._run_job, job)
                 if job.future is not None and not job.future.done():
                     job.future.set_result(result)
                 self.completed += 1
+                logger.info(
+                    "request=%s stage=cfm_done run_sec=%.3f completed=%s",
+                    job.request_id,
+                    time.perf_counter() - run_started_at,
+                    self.completed,
+                )
             except Exception as exc:
                 if job.future is not None and not job.future.done():
                     job.future.set_exception(exc)
                 self.failed += 1
+                logger.exception(
+                    "request=%s stage=cfm_failed run_sec=%.3f",
+                    job.request_id,
+                    time.perf_counter() - run_started_at,
+                )
             finally:
                 self.active -= 1
 
@@ -427,8 +458,10 @@ class CFMScheduler:
         generated_wave_chunks = []
         processed_frames = 0
         previous_chunk = None
+        chunk_index = 0
 
         while processed_frames < cond.size(1):
+            chunk_started_at = time.perf_counter()
             chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
             is_last_chunk = processed_frames + max_source_window >= cond.size(1)
             cat_condition = torch.cat([timbre.prompt_condition, chunk_cond], dim=1)
@@ -448,7 +481,22 @@ class CFMScheduler:
                 stream_output=False,
             )
             if should_break:
+                logger.info(
+                    "request=%s stage=cfm_chunk_done chunk=%s chunk_sec=%.3f last=%s",
+                    job.request_id,
+                    chunk_index,
+                    time.perf_counter() - chunk_started_at,
+                    is_last_chunk,
+                )
                 return self.vc_wrapper.sr, full_audio
+            logger.info(
+                "request=%s stage=cfm_chunk_done chunk=%s chunk_sec=%.3f last=%s",
+                job.request_id,
+                chunk_index,
+                time.perf_counter() - chunk_started_at,
+                is_last_chunk,
+            )
+            chunk_index += 1
 
         return self.vc_wrapper.sr, np.concatenate(generated_wave_chunks)
 
@@ -524,16 +572,28 @@ class ConcurrentVoiceConversionService:
         params: ConcurrentInferenceParams,
     ) -> Tuple[str, int, np.ndarray]:
         request_id = str(uuid.uuid4())
+        total_started_at = time.perf_counter()
+        feature_lock_wait_started_at = time.perf_counter()
         async with self._feature_lock:
+            feature_lock_wait_sec = time.perf_counter() - feature_lock_wait_started_at
+            prepare_started_at = time.perf_counter()
             source_features, timbre_features = await asyncio.to_thread(
                 self._prepare_features,
+                request_id,
                 source_audio_path,
                 target_audio_path,
                 params.convert_style,
             )
+            logger.info(
+                "request=%s stage=prepare_done lock_wait_sec=%.3f prepare_sec=%.3f",
+                request_id,
+                feature_lock_wait_sec,
+                time.perf_counter() - prepare_started_at,
+            )
 
         ar_outputs = None
         if params.convert_style:
+            ar_started_at = time.perf_counter()
             ar_outputs = []
             for prompt_text, prompt_target in self._build_ar_chunks(source_features, timbre_features, params):
                 ar_request = ARGenerateRequest(
@@ -543,6 +603,12 @@ class ConcurrentVoiceConversionService:
                     params=params,
                 )
                 ar_outputs.append(await self.ar_scheduler.submit(ar_request))
+            logger.info(
+                "request=%s stage=ar_done ar_sec=%.3f chunks=%s",
+                request_id,
+                time.perf_counter() - ar_started_at,
+                len(ar_outputs),
+            )
 
         audio = await self.cfm_scheduler.submit(
             CFMJob(
@@ -554,25 +620,61 @@ class ConcurrentVoiceConversionService:
             )
         )
         sample_rate, waveform = audio
+        logger.info(
+            "request=%s stage=convert_done total_sec=%.3f output_samples=%s",
+            request_id,
+            time.perf_counter() - total_started_at,
+            len(waveform),
+        )
         return request_id, sample_rate, waveform
 
     def _prepare_features(
         self,
+        request_id: str,
         source_audio_path: str,
         target_audio_path: str,
         require_source_narrow: bool,
     ) -> Tuple[SourceFeatures, TimbreFeatures]:
-        timbre = self._get_or_compute_timbre_features(target_audio_path)
+        timbre_started_at = time.perf_counter()
+        timbre = self._get_or_compute_timbre_features(request_id, target_audio_path)
+        logger.info(
+            "request=%s stage=timbre_done elapsed_sec=%.3f cache_key=%s",
+            request_id,
+            time.perf_counter() - timbre_started_at,
+            timbre.cache_key,
+        )
+        source_started_at = time.perf_counter()
         source = self._compute_source_features(source_audio_path, require_source_narrow)
+        logger.info(
+            "request=%s stage=source_features_done elapsed_sec=%.3f source_mel_len=%s require_narrow=%s",
+            request_id,
+            time.perf_counter() - source_started_at,
+            source.source_mel_len,
+            require_source_narrow,
+        )
         return source, timbre
 
-    def _get_or_compute_timbre_features(self, target_audio_path: str) -> TimbreFeatures:
+    def _get_or_compute_timbre_features(self, request_id: str, target_audio_path: str) -> TimbreFeatures:
+        md5_started_at = time.perf_counter()
         cache_key = self._target_audio_cache_key(target_audio_path)
+        logger.info(
+            "request=%s stage=timbre_md5_done elapsed_sec=%.3f",
+            request_id,
+            time.perf_counter() - md5_started_at,
+        )
         cached = self.timbre_cache.get(cache_key)
         if cached is not None:
+            logger.info("request=%s stage=timbre_cache_hit cache_key=%s", request_id, cache_key)
             return cached
+        logger.info("request=%s stage=timbre_cache_miss cache_key=%s", request_id, cache_key)
+        compute_started_at = time.perf_counter()
         features = self._compute_timbre_features(cache_key, target_audio_path)
         self.timbre_cache.put(cache_key, features)
+        logger.info(
+            "request=%s stage=timbre_compute_done elapsed_sec=%.3f",
+            request_id,
+            time.perf_counter() - compute_started_at,
+        )
         return features
 
     @staticmethod

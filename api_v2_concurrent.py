@@ -2,6 +2,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 from functools import lru_cache
+import logging
 import platform
 import re
 import shutil
@@ -22,6 +23,9 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from modules.v2.concurrent import ConcurrentInferenceParams, ConcurrentVoiceConversionService
+
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".opus", ".ogg"}
@@ -129,6 +133,7 @@ async def convert(
     if service is None:
         raise HTTPException(status_code=503, detail="service is not initialized")
 
+    request_started_at = time.perf_counter()
     source_suffix = validate_input_file(source_audio_file, "source_audio_file")
     target_suffix = validate_input_file(target_audio_file, "target_audio_file")
     output_suffix = validate_output_format(output_format)
@@ -154,8 +159,16 @@ async def convert(
     try:
         source_path = temp_dir_path / f"source{source_suffix}"
         target_path = temp_dir_path / f"target{target_suffix}"
+        upload_started_at = time.perf_counter()
         await save_upload_file(source_audio_file, source_path)
         await save_upload_file(target_audio_file, target_path)
+        logger.info(
+            "stage=upload_saved upload_sec=%.3f source_bytes=%s target_bytes=%s output_format=%s",
+            time.perf_counter() - upload_started_at,
+            source_path.stat().st_size,
+            target_path.stat().st_size,
+            output_suffix,
+        )
 
         try:
             request_id, sample_rate, waveform = await service.convert(
@@ -168,7 +181,15 @@ async def convert(
 
         filename = f"{request_id}{output_suffix}"
         output_path = temp_dir_path / filename
+        encode_started_at = time.perf_counter()
         await asyncio.to_thread(write_audio_file, output_path, waveform, sample_rate, output_suffix)
+        logger.info(
+            "request=%s stage=output_encoded encode_sec=%.3f output_bytes=%s total_api_sec=%.3f",
+            request_id,
+            time.perf_counter() - encode_started_at,
+            output_path.stat().st_size,
+            time.perf_counter() - request_started_at,
+        )
     except HTTPException:
         shutil.rmtree(temp_dir_path, ignore_errors=True)
         raise
@@ -460,6 +481,10 @@ async def initialize_service(args) -> None:
 
 def main():
     global server_args
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     args = build_arg_parser().parse_args()
     server_args = args
     tunnel_process = start_colab_tunnel(args.port) if args.colab else None
