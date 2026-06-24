@@ -18,7 +18,8 @@ import torch
 import uvicorn
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from modules.v2.concurrent import ConcurrentInferenceParams, ConcurrentVoiceConversionService
 
@@ -36,10 +37,17 @@ FFMPEG_OUTPUT_ARGS = {
     ".m4a": ["-codec:a", "aac", "-b:a", "192k"],
     ".opus": ["-codec:a", "libopus", "-b:a", "128k"],
 }
+OUTPUT_MEDIA_TYPES = {
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".opus": "audio/ogg",
+    ".ogg": "audio/ogg",
+}
 CLOUDFLARED_PUBLIC_URL_RE = re.compile(r"https://[-a-zA-Z0-9.]+trycloudflare\.com")
 CLOUDFLARED_PATH = Path(".tools") / "cloudflared"
 MODEL_DIR = Path("models")
-DEFAULT_OUTPUT_DIR = Path("outputs/api_v2")
 AR_CHECKPOINT_PATH = MODEL_DIR / "seed-vc-v2" / "ar_base.pth"
 CFM_CHECKPOINT_PATH = MODEL_DIR / "seed-vc-v2" / "cfm_small.pth"
 CONTENT_EXTRACTOR_NARROW_CHECKPOINT_PATH = (
@@ -88,14 +96,6 @@ async def lifespan(_app: FastAPI):
             await service.stop()
 
 
-class ConvertResponse(BaseModel):
-    request_id: str
-    output_path: str
-    sample_rate: int
-    duration_sec: float
-    elapsed_sec: float
-
-
 app = FastAPI(title="Seed-VC V2 Concurrent API", version="0.1.0", lifespan=lifespan)
 
 
@@ -111,14 +111,11 @@ async def metrics():
     return service.metrics()
 
 
-@app.post("/v2/convert", response_model=ConvertResponse)
+@app.post("/v2/convert")
 async def convert(
     source_audio_file: UploadFile = File(..., description="Source audio file"),
     target_audio_file: UploadFile = File(..., description="Reference audio file"),
-    output_path: Optional[str] = Form(
-        None,
-        description="Optional server output path ending with .wav, .flac, .mp3, .m4a, .opus, or .ogg",
-    ),
+    output_format: str = Form("wav", description="Output format: wav, flac, mp3, m4a, opus, or ogg"),
     diffusion_steps: int = Form(30),
     length_adjust: float = Form(1.0),
     intelligibility_cfg_rate: float = Form(0.7),
@@ -134,8 +131,7 @@ async def convert(
 
     source_suffix = validate_input_file(source_audio_file, "source_audio_file")
     target_suffix = validate_input_file(target_audio_file, "target_audio_file")
-    resolved_output_path = Path(output_path).expanduser() if output_path else None
-    output_suffix = validate_output_path(resolved_output_path) if resolved_output_path is not None else ".wav"
+    output_suffix = validate_output_format(output_format)
     if output_suffix in FFMPEG_OUTPUT_SUFFIXES and resolve_ffmpeg_executable() is None:
         raise HTTPException(
             status_code=500,
@@ -154,9 +150,8 @@ async def convert(
         anonymization_only=anonymization_only,
     )
 
-    started_at = time.time()
-    with tempfile.TemporaryDirectory(prefix="seed_vc_upload_") as temp_dir:
-        temp_dir_path = Path(temp_dir)
+    temp_dir_path = Path(tempfile.mkdtemp(prefix="seed_vc_convert_"))
+    try:
         source_path = temp_dir_path / f"source{source_suffix}"
         target_path = temp_dir_path / f"target{target_suffix}"
         await save_upload_file(source_audio_file, source_path)
@@ -171,17 +166,21 @@ async def convert(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    if resolved_output_path is None:
-        resolved_output_path = DEFAULT_OUTPUT_DIR / f"{request_id}.wav"
-    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(write_audio_file, resolved_output_path, waveform, sample_rate, output_suffix)
-    elapsed = time.time() - started_at
-    return ConvertResponse(
-        request_id=request_id,
-        output_path=str(resolved_output_path.resolve()),
-        sample_rate=sample_rate,
-        duration_sec=float(len(waveform) / sample_rate),
-        elapsed_sec=elapsed,
+        filename = f"{request_id}{output_suffix}"
+        output_path = temp_dir_path / filename
+        await asyncio.to_thread(write_audio_file, output_path, waveform, sample_rate, output_suffix)
+    except HTTPException:
+        shutil.rmtree(temp_dir_path, ignore_errors=True)
+        raise
+    except Exception as exc:
+        shutil.rmtree(temp_dir_path, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return FileResponse(
+        output_path,
+        media_type=OUTPUT_MEDIA_TYPES[output_suffix],
+        filename=filename,
+        background=BackgroundTask(shutil.rmtree, temp_dir_path, ignore_errors=True),
     )
 
 
@@ -208,11 +207,13 @@ async def save_upload_file(upload_file: UploadFile, destination: Path) -> None:
     await upload_file.close()
 
 
-def validate_output_path(output_path: Path) -> str:
-    suffix = output_path.suffix.lower()
+def validate_output_format(output_format: str) -> str:
+    suffix = output_format.strip().lower()
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
     if suffix not in SUPPORTED_OUTPUT_SUFFIXES:
         supported = ", ".join(sorted(SUPPORTED_OUTPUT_SUFFIXES))
-        actual = suffix or "<missing>"
+        actual = output_format or "<missing>"
         raise HTTPException(
             status_code=400,
             detail=f"unsupported output format: {actual}. Supported formats: {supported}",

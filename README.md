@@ -68,13 +68,15 @@ python api_v2_concurrent.py --colab --ar-slots 2 --cfm-max-concurrent 1 --port 8
 curl -X POST http://127.0.0.1:8000/v2/convert \
   -F "source_audio_file=@examples/source/source_s1.wav" \
   -F "target_audio_file=@examples/reference/s1p1.wav" \
-  -F "output_path=outputs/api_v2/result.wav" \
-  -F "convert_style=false"
+  -F "output_format=wav" \
+  -F "convert_style=false" \
+  --output result.wav
 ```
 
 `source_audio_file` and `target_audio_file` are uploaded as multipart files.
-Supported input and output suffixes are `.wav`, `.flac`, `.mp3`, `.m4a`,
-`.opus`, and `.ogg`.
+The response body is the converted audio file. Supported input suffixes are
+`.wav`, `.flac`, `.mp3`, `.m4a`, `.opus`, and `.ogg`; supported
+`output_format` values are `wav`, `flac`, `mp3`, `m4a`, `opus`, and `ogg`.
 
 Useful endpoints:
 
