@@ -16,6 +16,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 @dataclass
 class ConcurrentInferenceParams:
     diffusion_steps: int = 30
@@ -400,12 +405,21 @@ class CFMScheduler:
 
     def _run_timbre_job(self, job: CFMJob) -> Tuple[int, np.ndarray]:
         source = job.source_features
-        timbre = job.timbre_features
+        regulator_started_at = time.perf_counter()
+        synchronize_device(self.device)
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             cond, _ = self.vc_wrapper.cfm_length_regulator(
                 source.source_content_indices,
                 ylens=torch.LongTensor([source.source_mel_len]).to(self.device),
             )
+        synchronize_device(self.device)
+        logger.info(
+            "request=%s stage=cfm_length_regulator_done elapsed_sec=%.3f cond_len=%s source_mel_len=%s",
+            job.request_id,
+            time.perf_counter() - regulator_started_at,
+            cond.size(1),
+            source.source_mel_len,
+        )
         return self._render_condition_chunks(job, cond)
 
     def _run_style_job(self, job: CFMJob) -> Tuple[int, np.ndarray]:
@@ -465,11 +479,21 @@ class CFMScheduler:
             chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
             is_last_chunk = processed_frames + max_source_window >= cond.size(1)
             cat_condition = torch.cat([timbre.prompt_condition, chunk_cond], dim=1)
+            condition_len = cat_condition.size(1)
+            cfm_started_at = time.perf_counter()
+            synchronize_device(self.device)
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 vc_mel = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
-            original_len = cat_condition.size(1)
+            synchronize_device(self.device)
+            cfm_infer_sec = time.perf_counter() - cfm_started_at
+            original_len = condition_len
             vc_mel = vc_mel[:, :, timbre.target_mel_len:original_len]
+            vocoder_started_at = time.perf_counter()
+            synchronize_device(self.device)
             vc_wave = self.vc_wrapper.vocoder(vc_mel).squeeze()[None]
+            synchronize_device(self.device)
+            vocoder_sec = time.perf_counter() - vocoder_started_at
+            stream_started_at = time.perf_counter()
             processed_frames, previous_chunk, should_break, _, full_audio = self.vc_wrapper._stream_wave_chunks(
                 vc_wave,
                 processed_frames,
@@ -480,22 +504,27 @@ class CFMScheduler:
                 is_last_chunk,
                 stream_output=False,
             )
-            if should_break:
-                logger.info(
-                    "request=%s stage=cfm_chunk_done chunk=%s chunk_sec=%.3f last=%s",
-                    job.request_id,
-                    chunk_index,
-                    time.perf_counter() - chunk_started_at,
-                    is_last_chunk,
-                )
-                return self.vc_wrapper.sr, full_audio
+            stream_cpu_sec = time.perf_counter() - stream_started_at
+            chunk_sec = time.perf_counter() - chunk_started_at
             logger.info(
-                "request=%s stage=cfm_chunk_done chunk=%s chunk_sec=%.3f last=%s",
+                (
+                    "request=%s stage=cfm_chunk_done chunk=%s chunk_sec=%.3f "
+                    "cfm_infer_sec=%.3f vocoder_sec=%.3f stream_cpu_sec=%.3f "
+                    "condition_len=%s source_chunk_len=%s output_mel_len=%s last=%s"
+                ),
                 job.request_id,
                 chunk_index,
-                time.perf_counter() - chunk_started_at,
+                chunk_sec,
+                cfm_infer_sec,
+                vocoder_sec,
+                stream_cpu_sec,
+                condition_len,
+                chunk_cond.size(1),
+                vc_mel.size(2),
                 is_last_chunk,
             )
+            if should_break:
+                return self.vc_wrapper.sr, full_audio
             chunk_index += 1
 
         return self.vc_wrapper.sr, np.concatenate(generated_wave_chunks)
@@ -644,7 +673,7 @@ class ConcurrentVoiceConversionService:
             timbre.cache_key,
         )
         source_started_at = time.perf_counter()
-        source = self._compute_source_features(source_audio_path, require_source_narrow)
+        source = self._compute_source_features(request_id, source_audio_path, require_source_narrow)
         logger.info(
             "request=%s stage=source_features_done elapsed_sec=%.3f source_mel_len=%s require_narrow=%s",
             request_id,
@@ -668,7 +697,7 @@ class ConcurrentVoiceConversionService:
             return cached
         logger.info("request=%s stage=timbre_cache_miss cache_key=%s", request_id, cache_key)
         compute_started_at = time.perf_counter()
-        features = self._compute_timbre_features(cache_key, target_audio_path)
+        features = self._compute_timbre_features(request_id, cache_key, target_audio_path)
         self.timbre_cache.put(cache_key, features)
         logger.info(
             "request=%s stage=timbre_compute_done elapsed_sec=%.3f",
@@ -687,24 +716,78 @@ class ConcurrentVoiceConversionService:
 
     @torch.no_grad()
     @torch.inference_mode()
-    def _compute_timbre_features(self, cache_key: str, target_audio_path: str) -> TimbreFeatures:
+    def _compute_timbre_features(self, request_id: str, cache_key: str, target_audio_path: str) -> TimbreFeatures:
+        load_started_at = time.perf_counter()
         target_wave = librosa.load(target_audio_path, sr=self.vc_wrapper.sr)[0]
         target_wave = target_wave[: self.vc_wrapper.sr * (self.vc_wrapper.dit_max_context_len - 5)]
+        load_sec = time.perf_counter() - load_started_at
+        tensor_started_at = time.perf_counter()
         target_wave_tensor = torch.tensor(target_wave).unsqueeze(0).float().to(self.device)
+        synchronize_device(self.device)
+        tensor_to_device_sec = time.perf_counter() - tensor_started_at
+        resample_started_at = time.perf_counter()
         target_wave_16k = librosa.resample(target_wave, orig_sr=self.vc_wrapper.sr, target_sr=16000)
+        resample_sec = time.perf_counter() - resample_started_at
+        tensor_16k_started_at = time.perf_counter()
         target_wave_16k_tensor = torch.tensor(target_wave_16k).unsqueeze(0).to(self.device)
+        synchronize_device(self.device)
+        tensor_16k_to_device_sec = time.perf_counter() - tensor_16k_started_at
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            mel_started_at = time.perf_counter()
+            synchronize_device(self.device)
             target_mel = self.vc_wrapper.mel_fn(target_wave_tensor)
+            synchronize_device(self.device)
+            mel_sec = time.perf_counter() - mel_started_at
             target_mel_len = target_mel.size(2)
+            wide_started_at = time.perf_counter()
+            synchronize_device(self.device)
             target_content_indices = self.vc_wrapper._process_content_features(target_wave_16k_tensor, is_narrow=False)
+            synchronize_device(self.device)
+            wide_content_sec = time.perf_counter() - wide_started_at
+            narrow_started_at = time.perf_counter()
+            synchronize_device(self.device)
             target_narrow_indices = self.vc_wrapper._process_content_features(target_wave_16k_tensor, is_narrow=True)
+            synchronize_device(self.device)
+            narrow_content_sec = time.perf_counter() - narrow_started_at
+            reduction_started_at = time.perf_counter()
             target_narrow_reduced, _ = self.vc_wrapper.duration_reduction_func(target_narrow_indices[0], 1)
+            reduction_sec = time.perf_counter() - reduction_started_at
+            style_started_at = time.perf_counter()
+            synchronize_device(self.device)
             target_style = self.vc_wrapper.compute_style(target_wave_16k_tensor)
+            synchronize_device(self.device)
+            style_sec = time.perf_counter() - style_started_at
+            prompt_started_at = time.perf_counter()
+            synchronize_device(self.device)
             prompt_condition, _ = self.vc_wrapper.cfm_length_regulator(
                 target_content_indices,
                 ylens=torch.LongTensor([target_mel_len]).to(self.device),
             )
+            synchronize_device(self.device)
+            prompt_regulator_sec = time.perf_counter() - prompt_started_at
+
+        logger.info(
+            (
+                "request=%s stage=timbre_profile cache_key=%s load_sec=%.3f tensor_to_device_sec=%.3f "
+                "resample_sec=%.3f tensor_16k_to_device_sec=%.3f mel_sec=%.3f "
+                "wide_content_sec=%.3f narrow_content_sec=%.3f reduction_sec=%.3f "
+                "style_sec=%.3f prompt_regulator_sec=%.3f target_mel_len=%s"
+            ),
+            request_id,
+            cache_key,
+            load_sec,
+            tensor_to_device_sec,
+            resample_sec,
+            tensor_16k_to_device_sec,
+            mel_sec,
+            wide_content_sec,
+            narrow_content_sec,
+            reduction_sec,
+            style_sec,
+            prompt_regulator_sec,
+            target_mel_len,
+        )
 
         return TimbreFeatures(
             cache_key=cache_key,
@@ -719,19 +802,65 @@ class ConcurrentVoiceConversionService:
 
     @torch.no_grad()
     @torch.inference_mode()
-    def _compute_source_features(self, source_audio_path: str, require_narrow: bool) -> SourceFeatures:
+    def _compute_source_features(self, request_id: str, source_audio_path: str, require_narrow: bool) -> SourceFeatures:
+        load_started_at = time.perf_counter()
         source_wave = librosa.load(source_audio_path, sr=self.vc_wrapper.sr)[0]
+        load_sec = time.perf_counter() - load_started_at
+        tensor_started_at = time.perf_counter()
         source_wave_tensor = torch.tensor(source_wave).unsqueeze(0).float().to(self.device)
+        synchronize_device(self.device)
+        tensor_to_device_sec = time.perf_counter() - tensor_started_at
+        resample_started_at = time.perf_counter()
         source_wave_16k = librosa.resample(source_wave, orig_sr=self.vc_wrapper.sr, target_sr=16000)
+        resample_sec = time.perf_counter() - resample_started_at
+        tensor_16k_started_at = time.perf_counter()
         source_wave_16k_tensor = torch.tensor(source_wave_16k).unsqueeze(0).to(self.device)
+        synchronize_device(self.device)
+        tensor_16k_to_device_sec = time.perf_counter() - tensor_16k_started_at
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            mel_started_at = time.perf_counter()
+            synchronize_device(self.device)
             source_mel = self.vc_wrapper.mel_fn(source_wave_tensor)
+            synchronize_device(self.device)
+            mel_sec = time.perf_counter() - mel_started_at
+            wide_started_at = time.perf_counter()
+            synchronize_device(self.device)
             source_content_indices = self.vc_wrapper._process_content_features(source_wave_16k_tensor, is_narrow=False)
+            synchronize_device(self.device)
+            wide_content_sec = time.perf_counter() - wide_started_at
             source_narrow_reduced = None
+            narrow_content_sec = 0.0
+            reduction_sec = 0.0
             if require_narrow:
+                narrow_started_at = time.perf_counter()
+                synchronize_device(self.device)
                 source_narrow_indices = self.vc_wrapper._process_content_features(source_wave_16k_tensor, is_narrow=True)
+                synchronize_device(self.device)
+                narrow_content_sec = time.perf_counter() - narrow_started_at
+                reduction_started_at = time.perf_counter()
                 source_narrow_reduced, _ = self.vc_wrapper.duration_reduction_func(source_narrow_indices[0], 1)
+                reduction_sec = time.perf_counter() - reduction_started_at
+
+        logger.info(
+            (
+                "request=%s stage=source_profile load_sec=%.3f tensor_to_device_sec=%.3f "
+                "resample_sec=%.3f tensor_16k_to_device_sec=%.3f mel_sec=%.3f "
+                "wide_content_sec=%.3f narrow_content_sec=%.3f reduction_sec=%.3f "
+                "source_mel_len=%s require_narrow=%s"
+            ),
+            request_id,
+            load_sec,
+            tensor_to_device_sec,
+            resample_sec,
+            tensor_16k_to_device_sec,
+            mel_sec,
+            wide_content_sec,
+            narrow_content_sec,
+            reduction_sec,
+            source_mel.size(2),
+            require_narrow,
+        )
 
         return SourceFeatures(
             source_audio_path=source_audio_path,
