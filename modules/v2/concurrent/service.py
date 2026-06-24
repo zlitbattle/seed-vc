@@ -465,7 +465,7 @@ class CFMScheduler:
             chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
             is_last_chunk = processed_frames + max_source_window >= cond.size(1)
             cat_condition = torch.cat([timbre.prompt_condition, chunk_cond], dim=1)
-            with torch.autocast(device_type=self.device.type, dtype=torch.float32):
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 vc_mel = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
             original_len = cat_condition.size(1)
             vc_mel = vc_mel[:, :, timbre.target_mel_len:original_len]
