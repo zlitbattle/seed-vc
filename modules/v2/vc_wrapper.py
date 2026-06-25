@@ -126,11 +126,13 @@ class VoiceConversionWrapper(torch.nn.Module):
             # CFM runs inside a ThreadPoolExecutor in the concurrent API. Inductor
             # CUDA Graph Trees can hit thread-local state assertions there, so keep
             # the inductor graph but disable cudagraph capture for this compiled path.
+            # This PyTorch version does not allow mode and options together.
+            compile_kwargs.pop("mode", None)
             compile_kwargs["options"] = {"triton.cudagraphs": False}
         logger.info(
             "stage=cfm_compile_config backend=%s mode=%s triton_cudagraphs=%s",
             compile_kwargs["backend"],
-            compile_kwargs["mode"],
+            compile_kwargs.get("mode"),
             compile_kwargs.get("options", {}).get("triton.cudagraphs", "default"),
         )
         self.cfm.estimator.transformer = torch.compile(self.cfm.estimator.transformer, **compile_kwargs)
