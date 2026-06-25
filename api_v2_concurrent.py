@@ -3,6 +3,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import logging
+import os
 import platform
 import re
 import shutil
@@ -431,7 +432,22 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
     from omegaconf import DictConfig
 
     cfg = DictConfig(yaml.safe_load(open("configs/v2/vc_wrapper.yaml", "r")))
-    vc_wrapper = instantiate(cfg)
+    bigvgan_cuda_kernel_enabled = should_enable_bigvgan_cuda_kernel(device)
+    cfg.vocoder.use_cuda_kernel = bigvgan_cuda_kernel_enabled
+    try:
+        vc_wrapper = instantiate_vc_wrapper(instantiate, cfg)
+    except Exception as exc:
+        if not bigvgan_cuda_kernel_enabled:
+            raise
+        logger.warning(
+            "stage=bigvgan_cuda_kernel_fallback error_type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+        cfg.vocoder.use_cuda_kernel = False
+        vc_wrapper = instantiate_vc_wrapper(instantiate, cfg)
+
+    logger.info("stage=bigvgan_vocoder_loaded use_cuda_kernel=%s", bool(cfg.vocoder.use_cuda_kernel))
     vc_wrapper.load_checkpoints(
         ar_checkpoint_path=AR_CHECKPOINT_PATH,
         cfm_checkpoint_path=CFM_CHECKPOINT_PATH,
@@ -451,6 +467,56 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
         configure_torch_compile()
         vc_wrapper.compile_cfm()
     return vc_wrapper
+
+
+def instantiate_vc_wrapper(instantiate, cfg):
+    previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    try:
+        return instantiate(cfg)
+    finally:
+        if previous_arch_list is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch_list
+
+
+def should_enable_bigvgan_cuda_kernel(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        logger.info("stage=bigvgan_cuda_kernel_skipped reason=non_cuda_device device=%s", device)
+        return False
+
+    missing_tools = []
+    if resolve_nvcc_executable() is None:
+        missing_tools.append("nvcc")
+    if shutil.which("ninja") is None:
+        missing_tools.append("ninja")
+    if missing_tools:
+        logger.warning(
+            "stage=bigvgan_cuda_kernel_skipped reason=missing_build_tools tools=%s",
+            ",".join(missing_tools),
+        )
+        return False
+
+    major, minor = torch.cuda.get_device_capability(device)
+    logger.info("stage=bigvgan_cuda_kernel_enabled capability=sm_%s%s", major, minor)
+    return True
+
+
+def resolve_nvcc_executable() -> Optional[str]:
+    nvcc = shutil.which("nvcc")
+    if nvcc is not None:
+        return nvcc
+    try:
+        from torch.utils import cpp_extension
+    except Exception:
+        return None
+    cuda_home = cpp_extension.CUDA_HOME
+    if cuda_home is None:
+        return None
+    candidate = Path(cuda_home) / "bin" / "nvcc"
+    if candidate.is_file():
+        return str(candidate)
+    return None
 
 
 def configure_torch_compile() -> None:
