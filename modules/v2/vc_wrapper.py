@@ -143,7 +143,7 @@ class VoiceConversionWrapper(torch.nn.Module):
 
     @staticmethod
     def _build_cfm_compile_buckets(compile_len: int) -> tuple[int, ...]:
-        buckets = (1024, 1280, 1536, 1792, 1920, 2048, 2304, compile_len)
+        buckets = (1024, 1280, 1536, 1792, 2048, 2304, compile_len)
         return tuple(dict.fromkeys(bucket for bucket in buckets if bucket <= compile_len))
 
     def select_cfm_compile_bucket(self, condition_len: int) -> int:
