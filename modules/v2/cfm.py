@@ -1,5 +1,4 @@
 import torch
-from tqdm import tqdm
 
 class CFM(torch.nn.Module):
     def __init__(
@@ -73,7 +72,7 @@ class CFM(torch.nn.Module):
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
-        for step in tqdm(range(1, len(t_span))):
+        for step in range(1, len(t_span)):
             if random_voice:
                 cfg_dphi_dt = self.estimator(
                     torch.cat([x, x], dim=0),

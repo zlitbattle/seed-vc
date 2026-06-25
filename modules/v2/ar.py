@@ -6,7 +6,6 @@ from functools import partial, wraps
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Sequence, Union
-from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -402,7 +401,7 @@ class NaiveWrapper(nn.Module):
         emb_seq = torch.cat([sep_token_emb, cond, sep_token_emb], dim=1)
         pred_codes = []
         input_pos = torch.arange(cond.size(1) + 1, device=cond.device)
-        for i in tqdm(range(4000)):
+        for i in range(4000):
             input_pos = torch.cat([input_pos, torch.LongTensor([i]).to(cond.device)], dim=0)
             base = self.model.infer_slow(emb_seq, input_pos)
             if base == self.model.config.vocab_size - 1:
@@ -435,7 +434,7 @@ class NaiveWrapper(nn.Module):
         pred_codes.append(pred_base)
         new_emb = self.model.embed_base(pred_base.unsqueeze(0), torch.LongTensor([1]).to(pred_base.device))[1]
         emb_seq = torch.cat([emb_seq, new_emb], dim=1)
-        for _ in tqdm(range(4000)):
+        for _ in range(4000):
             suppress_eos = len(pred_codes) < 10
             input_pos = input_pos[-1:] + 1
             kv_pos = kv_pos[-1:] + 1
