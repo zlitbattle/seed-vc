@@ -209,6 +209,8 @@ class BaseTransformer(nn.Module):
             ).to(device)
 
     def embed_base(self, x: Tensor, x_lens: Tensor) -> Tensor:
+        if x.is_inference():
+            x = x.clone()
         for bib in range(x.size(0)):
             x[bib, x_lens[bib]:] = self.config.vocab_size - 1
 

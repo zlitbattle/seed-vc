@@ -185,6 +185,7 @@ async def convert(
                 params,
             )
         except Exception as exc:
+            logger.exception("stage=convert_failed error_type=%s", type(exc).__name__)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         filename = f"{request_id}{output_suffix}"

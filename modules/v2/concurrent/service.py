@@ -199,6 +199,7 @@ class ARScheduler:
         request.slot_id = self.free_slots.pop(0)
         self.active.append(request)
 
+    @torch.no_grad()
     def _prefill_one(self, request: ARGenerateRequest) -> None:
         assert request.slot_id is not None
         emb_seq, input_pos, kv_pos = self.ar_wrapper.build_generation_inputs(
@@ -228,6 +229,7 @@ class ARScheduler:
         request.next_kv_pos = kv_pos[-1:] + 1
         request.is_prefilled = True
 
+    @torch.no_grad()
     def _decode_one_step(self, requests: Sequence[ARGenerateRequest]) -> None:
         eos_token = self.ar_wrapper.model.config.vocab_size - 1
         for request in list(requests):
@@ -867,7 +869,6 @@ class ConcurrentVoiceConversionService:
         return f"md5:{digest.hexdigest()}"
 
     @torch.no_grad()
-    @torch.inference_mode()
     def _compute_timbre_features(self, request_id: str, cache_key: str, target_audio_path: str) -> TimbreFeatures:
         load_started_at = time.perf_counter()
         target_wave = librosa.load(target_audio_path, sr=self.vc_wrapper.sr)[0]
@@ -954,7 +955,6 @@ class ConcurrentVoiceConversionService:
         )
 
     @torch.no_grad()
-    @torch.inference_mode()
     def _compute_source_features(self, request_id: str, source_audio_path: str, require_narrow: bool) -> SourceFeatures:
         load_started_at = time.perf_counter()
         source_wave = librosa.load(source_audio_path, sr=self.vc_wrapper.sr)[0]
