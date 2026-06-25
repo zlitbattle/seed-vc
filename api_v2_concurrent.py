@@ -530,7 +530,7 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
             args.ar_slots,
             FIXED_AR_SLOTS,
         )
-    if args.compile_ar or args.compile_cfm:
+    if args.compile_ar or args.compile_ar_cudagraphs or args.compile_cfm:
         configure_torch_compile()
     if args.compile_cfm:
         vc_wrapper.compile_cfm()
@@ -604,6 +604,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfm-max-concurrent", type=int, default=1)
     parser.add_argument("--timbre-cache-size", type=int, default=20)
     parser.add_argument("--compile-ar", action="store_true")
+    parser.add_argument(
+        "--compile-ar-cudagraphs",
+        action="store_true",
+        help="Experimental: use torch.compile reduce-overhead/CUDA Graphs for AR decode",
+    )
     parser.add_argument("--compile-cfm", action="store_true")
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")
@@ -624,7 +629,8 @@ async def initialize_service(args) -> None:
         timbre_cache_size=args.timbre_cache_size,
         cfm_max_concurrent=args.cfm_max_concurrent,
         enable_profiling=args.enable_profiling,
-        compile_ar=args.compile_ar,
+        compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
+        compile_ar_cudagraphs=args.compile_ar_cudagraphs,
     )
     warmed_ar_batches = await service.warmup_ar_decode()
     if warmed_ar_batches:

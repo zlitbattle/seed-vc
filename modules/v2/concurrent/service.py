@@ -147,6 +147,7 @@ class ARScheduler:
         max_new_tokens: int = 4000,
         enable_profiling: bool = False,
         compile_decode: bool = False,
+        compile_decode_cudagraphs: bool = False,
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
     ):
         self.ar_wrapper = ar_wrapper
@@ -159,6 +160,7 @@ class ARScheduler:
         self.enable_profiling = enable_profiling
         self.compile_decode_requested = bool(compile_decode)
         self.compile_decode_enabled = bool(compile_decode and device.type == "cuda" and hasattr(torch, "compile"))
+        self.compile_decode_cudagraphs = bool(compile_decode_cudagraphs)
         self.compile_batch_sizes = tuple(sorted({
             int(batch_size) for batch_size in compile_batch_sizes
             if 1 <= int(batch_size) <= max_slots
@@ -188,7 +190,7 @@ class ARScheduler:
         logger.info(
             (
                 "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
-                "compile_requested=%s compile_enabled=%s compile_batches=%s profiling=%s"
+                "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s profiling=%s"
             ),
             self.max_slots,
             self.max_seq_len,
@@ -196,6 +198,7 @@ class ARScheduler:
             self.dtype,
             self.compile_decode_requested,
             self.compile_decode_enabled,
+            self.compile_decode_cudagraphs,
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
             self.enable_profiling,
         )
@@ -227,13 +230,17 @@ class ARScheduler:
         compile_kwargs = {
             "fullgraph": True,
             "backend": "inductor",
-            "options": {"triton.cudagraphs": False},
         }
+        if self.compile_decode_cudagraphs:
+            compile_kwargs["mode"] = "reduce-overhead"
+        else:
+            compile_kwargs["options"] = {"triton.cudagraphs": False}
         logger.info(
-            "stage=ar_compile_config backend=%s mode=%s triton_cudagraphs=%s",
+            "stage=ar_compile_config backend=%s mode=%s triton_cudagraphs=%s cudagraphs_requested=%s",
             compile_kwargs["backend"],
             compile_kwargs.get("mode"),
             compile_kwargs.get("options", {}).get("triton.cudagraphs", "default"),
+            self.compile_decode_cudagraphs,
         )
         for batch_size in self.compile_batch_sizes:
             batch_size = int(batch_size)
@@ -1150,6 +1157,7 @@ class ConcurrentVoiceConversionService:
         cfm_max_concurrent: int = 1,
         enable_profiling: bool = False,
         compile_ar: bool = False,
+        compile_ar_cudagraphs: bool = False,
     ):
         self.vc_wrapper = vc_wrapper
         self.device = device
@@ -1163,6 +1171,7 @@ class ConcurrentVoiceConversionService:
             max_seq_len=ar_max_seq_len,
             enable_profiling=enable_profiling,
             compile_decode=compile_ar,
+            compile_decode_cudagraphs=compile_ar_cudagraphs,
         )
         self.cfm_scheduler = CFMScheduler(
             vc_wrapper,
