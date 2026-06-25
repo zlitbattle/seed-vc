@@ -4,6 +4,7 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -342,11 +343,22 @@ class CFMScheduler:
         self.active = 0
         self.completed = 0
         self.failed = 0
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     async def start(self) -> None:
         if self._tasks:
             return
         self._running = True
+        executor_workers = 1 if self.vc_wrapper.dit_compiled else self.max_concurrent
+        self._executor = ThreadPoolExecutor(
+            max_workers=executor_workers,
+            thread_name_prefix="seed-vc-cfm",
+        )
+        logger.info(
+            "stage=cfm_executor_started workers=%s dit_compiled=%s",
+            executor_workers,
+            self.vc_wrapper.dit_compiled,
+        )
         for _ in range(self.max_concurrent):
             self._tasks.append(asyncio.create_task(self._worker()))
 
@@ -360,6 +372,9 @@ class CFMScheduler:
             except asyncio.CancelledError:
                 pass
         self._tasks.clear()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
 
     async def submit(self, job: CFMJob) -> Tuple[int, np.ndarray]:
         job.future = asyncio.get_running_loop().create_future()
@@ -387,7 +402,7 @@ class CFMScheduler:
                 self.queue.qsize(),
             )
             try:
-                result = await asyncio.to_thread(self._run_job, job)
+                result = await self._run_in_executor(self._run_job, job)
                 if job.future is not None and not job.future.done():
                     job.future.set_result(result)
                 self.completed += 1
@@ -408,6 +423,12 @@ class CFMScheduler:
                 )
             finally:
                 self.active -= 1
+
+    async def _run_in_executor(self, func, *args):
+        if self._executor is None:
+            raise RuntimeError("CFM scheduler is not started")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, func, *args)
 
     @torch.no_grad()
     @torch.inference_mode()
@@ -651,6 +672,13 @@ class CFMScheduler:
             torch.cuda.empty_cache()
         return warmed_buckets
 
+    async def warmup_compile_buckets_async(
+        self,
+        timbre: TimbreFeatures,
+        params: ConcurrentInferenceParams,
+    ) -> List[int]:
+        return await self._run_in_executor(self.warmup_compile_buckets, timbre, params)
+
     def _synchronize_for_profiling(self) -> None:
         if self.enable_profiling:
             synchronize_device(self.device)
@@ -716,7 +744,7 @@ class ConcurrentVoiceConversionService:
                 request_id,
                 target_audio_path,
             )
-        return await asyncio.to_thread(self.cfm_scheduler.warmup_compile_buckets, timbre, params)
+        return await self.cfm_scheduler.warmup_compile_buckets_async(timbre, params)
 
     async def convert(
         self,
