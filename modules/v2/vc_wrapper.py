@@ -112,6 +112,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         )
 
     def compile_cfm(self):
+        self.prepare_cfm_for_compile()
         self.cfm.estimator.transformer = torch.compile(
             self.cfm.estimator.transformer,
             fullgraph=True,
@@ -119,6 +120,15 @@ class VoiceConversionWrapper(torch.nn.Module):
             mode="reduce-overhead" if torch.cuda.is_available() else None,
         )
         self.dit_compiled = True
+
+    def prepare_cfm_for_compile(self):
+        transformer = self.cfm.estimator.transformer
+        freqs_cis = getattr(transformer, "freqs_cis", None)
+        if freqs_cis is None or freqs_cis.dtype != torch.bfloat16:
+            return
+        if freqs_cis.device.type == "cuda" and torch.cuda.is_bf16_supported():
+            return
+        transformer.freqs_cis = freqs_cis.to(dtype=torch.float32)
 
     @staticmethod
     def _build_cfm_compile_buckets(compile_len: int) -> tuple[int, ...]:

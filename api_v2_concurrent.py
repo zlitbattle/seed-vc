@@ -444,8 +444,16 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
         device=device,
     )
     if args.compile_cfm:
+        configure_torch_compile()
         vc_wrapper.compile_cfm()
     return vc_wrapper
+
+
+def configure_torch_compile() -> None:
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    if hasattr(torch._inductor.config, "fx_graph_cache"):
+        torch._inductor.config.fx_graph_cache = True
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
