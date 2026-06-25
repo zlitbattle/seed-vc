@@ -52,6 +52,8 @@ OUTPUT_MEDIA_TYPES = {
 }
 CLOUDFLARED_PUBLIC_URL_RE = re.compile(r"https://[-a-zA-Z0-9.]+trycloudflare\.com")
 CLOUDFLARED_PATH = Path(".tools") / "cloudflared"
+CLOUDFLARED_MAX_ATTEMPTS = 3
+CLOUDFLARED_RETRY_DELAY_SEC = 5.0
 MODEL_DIR = Path("models")
 AR_CHECKPOINT_PATH = MODEL_DIR / "seed-vc-v2" / "ar_base.pth"
 CFM_CHECKPOINT_PATH = MODEL_DIR / "seed-vc-v2" / "cfm_small.pth"
@@ -316,59 +318,113 @@ def prepare_audio_for_ffmpeg(waveform: np.ndarray) -> tuple[np.ndarray, int]:
     return np.ascontiguousarray(audio), channels
 
 
-def start_colab_tunnel(port: int) -> subprocess.Popen:
+class ColabTunnel:
+    def __init__(self, cloudflared_path: str, port: int):
+        self.cloudflared_path = cloudflared_path
+        self.port = port
+        self.stop_event = threading.Event()
+        self.process_lock = threading.Lock()
+        self.process: Optional[subprocess.Popen] = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "ColabTunnel":
+        self.thread.start()
+        return self
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.process_lock:
+            process = self.process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    def _run(self) -> None:
+        for attempt in range(1, CLOUDFLARED_MAX_ATTEMPTS + 1):
+            if self.stop_event.is_set():
+                return
+
+            process = self._start_process()
+            with self.process_lock:
+                self.process = process
+
+            saw_public_url = self._stream_output(process)
+            return_code = process.poll()
+            if self.stop_event.is_set():
+                return
+            if return_code in (None, 0):
+                return
+
+            print(f"[cloudflared] tunnel exited with code {return_code}", flush=True)
+            if attempt >= CLOUDFLARED_MAX_ATTEMPTS:
+                print(
+                    "[cloudflared] failed to start public tunnel after "
+                    f"{CLOUDFLARED_MAX_ATTEMPTS} attempts. Local API is still running.",
+                    flush=True,
+                )
+                return
+
+            reason = "after public URL was issued" if saw_public_url else "before public URL was issued"
+            print(
+                f"[cloudflared] restarting tunnel attempt {attempt + 1}/{CLOUDFLARED_MAX_ATTEMPTS} "
+                f"({reason})...",
+                flush=True,
+            )
+            self.stop_event.wait(CLOUDFLARED_RETRY_DELAY_SEC)
+
+    def _start_process(self) -> subprocess.Popen:
+        return subprocess.Popen(
+            [
+                self.cloudflared_path,
+                "tunnel",
+                "--url",
+                f"http://127.0.0.1:{self.port}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    @staticmethod
+    def _stream_output(process: subprocess.Popen) -> bool:
+        if process.stdout is None:
+            return False
+
+        public_url_printed = False
+        for line in process.stdout:
+            line = line.strip()
+            match = CLOUDFLARED_PUBLIC_URL_RE.search(line)
+            if match and not public_url_printed:
+                public_url = match.group(0)
+                public_url_printed = True
+                print("", flush=True)
+                print(f"Colab public API URL: {public_url}", flush=True)
+                print(f"Colab public API docs: {public_url}/docs", flush=True)
+                print("", flush=True)
+            elif "error" in line.lower() or "failed" in line.lower():
+                print(f"[cloudflared] {line}", flush=True)
+
+        return public_url_printed
+
+
+def start_colab_tunnel(port: int) -> ColabTunnel:
     cloudflared_path = resolve_cloudflared_executable(auto_download=True)
     if cloudflared_path is None:
         raise RuntimeError("cloudflared is required for --colab mode")
 
     print("Starting Cloudflare tunnel for Colab public access...", flush=True)
-    process = subprocess.Popen(
-        [
-            cloudflared_path,
-            "tunnel",
-            "--url",
-            f"http://127.0.0.1:{port}",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    threading.Thread(target=stream_colab_tunnel_output, args=(process,), daemon=True).start()
-    return process
+    return ColabTunnel(cloudflared_path, port).start()
 
 
-def stop_colab_tunnel(process: Optional[subprocess.Popen]) -> None:
-    if process is None or process.poll() is not None:
+def stop_colab_tunnel(tunnel: Optional[ColabTunnel]) -> None:
+    if tunnel is None:
         return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-
-
-def stream_colab_tunnel_output(process: subprocess.Popen) -> None:
-    if process.stdout is None:
-        return
-
-    public_url_printed = False
-    for line in process.stdout:
-        line = line.strip()
-        match = CLOUDFLARED_PUBLIC_URL_RE.search(line)
-        if match and not public_url_printed:
-            public_url = match.group(0)
-            public_url_printed = True
-            print("", flush=True)
-            print(f"Colab public API URL: {public_url}", flush=True)
-            print(f"Colab public API docs: {public_url}/docs", flush=True)
-            print("", flush=True)
-        elif "error" in line.lower() or "failed" in line.lower():
-            print(f"[cloudflared] {line}", flush=True)
-
-    return_code = process.poll()
-    if return_code not in (None, 0):
-        print(f"[cloudflared] tunnel exited with code {return_code}", flush=True)
+    tunnel.stop()
 
 
 def resolve_cloudflared_executable(auto_download: bool = False) -> Optional[str]:
