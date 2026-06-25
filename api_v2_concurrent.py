@@ -61,9 +61,10 @@ CONTENT_EXTRACTOR_WIDE_CHECKPOINT_PATH = (
     MODEL_DIR / "astral-quantization" / "bsq2048" / "bsq2048_light.pth"
 )
 STYLE_ENCODER_CHECKPOINT_PATH = MODEL_DIR / "campplus" / "campplus_cn_common.bin"
-WARMUP_SOURCE_SEC = 10.0
-WARMUP_TARGET_SEC = 12.0
+WARMUP_SOURCE_SEC = 20.0
+WARMUP_TARGET_SEC = 20.0
 WARMUP_AMPLITUDE = 0.02
+CFM_BUCKET_WARMUP_DIFFUSION_STEPS = 1
 
 
 def select_device() -> torch.device:
@@ -524,6 +525,15 @@ async def run_startup_warmup(started_service: ConcurrentVoiceConversionService) 
             output_sample_rate,
             len(waveform),
         )
+        warmed_buckets = await started_service.warmup_cfm_compile_buckets(
+            str(target_path),
+            ConcurrentInferenceParams(diffusion_steps=CFM_BUCKET_WARMUP_DIFFUSION_STEPS),
+        )
+        if warmed_buckets:
+            logger.info(
+                "stage=warmup_cfm_buckets_done buckets=%s",
+                ",".join(str(bucket_len) for bucket_len in warmed_buckets),
+            )
         started_service.timbre_cache.clear()
     finally:
         shutil.rmtree(warmup_dir_path, ignore_errors=True)

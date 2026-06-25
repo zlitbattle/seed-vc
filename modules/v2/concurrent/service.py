@@ -575,6 +575,82 @@ class CFMScheduler:
         )
         return vc_mel, compile_bucket_len, compile_pad_frames
 
+    @torch.no_grad()
+    @torch.inference_mode()
+    def warmup_compile_buckets(self, timbre: TimbreFeatures, params: ConcurrentInferenceParams) -> List[int]:
+        if not self.vc_wrapper.dit_compiled:
+            logger.info("stage=warmup_cfm_buckets_skipped reason=cfm_not_compiled")
+            return []
+
+        warmed_buckets = []
+        content_dim = int(timbre.prompt_condition.size(-1))
+        buckets = tuple(int(bucket_len) for bucket_len in self.vc_wrapper.cfm_compile_buckets)
+        logger.info(
+            "stage=warmup_cfm_buckets_start buckets=%s diffusion_steps=%s",
+            ",".join(str(bucket_len) for bucket_len in buckets),
+            params.diffusion_steps,
+        )
+        for bucket_len in buckets:
+            bucket_started_at = time.perf_counter()
+            request_id = f"warmup-cfm-bucket-{bucket_len}"
+            prompt_len = min(int(timbre.target_mel.size(-1)), max(1, bucket_len - 1))
+            warmup_timbre = TimbreFeatures(
+                cache_key=timbre.cache_key,
+                target_audio_path=timbre.target_audio_path,
+                target_mel=timbre.target_mel[:, :, :prompt_len].contiguous(),
+                target_mel_len=prompt_len,
+                target_content_indices=timbre.target_content_indices,
+                target_narrow_reduced=timbre.target_narrow_reduced,
+                target_style=timbre.target_style,
+                prompt_condition=timbre.prompt_condition[:, :prompt_len, :].contiguous(),
+            )
+            dummy_source = SourceFeatures(
+                source_audio_path="<cfm_bucket_warmup>",
+                source_mel_len=bucket_len,
+                source_content_indices=torch.empty(1, 0, dtype=torch.long, device=self.device),
+            )
+            job = CFMJob(
+                request_id=request_id,
+                params=params,
+                source_features=dummy_source,
+                timbre_features=warmup_timbre,
+            )
+            cat_condition = torch.zeros(
+                (1, bucket_len, content_dim),
+                dtype=timbre.prompt_condition.dtype,
+                device=self.device,
+            )
+            logger.info(
+                "request=%s stage=warmup_cfm_bucket_start bucket_len=%s prompt_len=%s",
+                request_id,
+                bucket_len,
+                prompt_len,
+            )
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                vc_mel, compile_bucket_len, compile_pad_frames = self._infer_cfm(
+                    job,
+                    cat_condition,
+                    random_voice=params.anonymization_only,
+                )
+            synchronize_device(self.device)
+            del vc_mel
+            warmed_buckets.append(bucket_len)
+            logger.info(
+                (
+                    "request=%s stage=warmup_cfm_bucket_done bucket_len=%s "
+                    "compile_bucket_len=%s compile_pad_frames=%s elapsed_sec=%.3f"
+                ),
+                request_id,
+                bucket_len,
+                compile_bucket_len,
+                compile_pad_frames,
+                time.perf_counter() - bucket_started_at,
+            )
+
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return warmed_buckets
+
     def _synchronize_for_profiling(self) -> None:
         if self.enable_profiling:
             synchronize_device(self.device)
@@ -627,6 +703,20 @@ class ConcurrentVoiceConversionService:
     async def stop(self) -> None:
         await self.ar_scheduler.stop()
         await self.cfm_scheduler.stop()
+
+    async def warmup_cfm_compile_buckets(
+        self,
+        target_audio_path: str,
+        params: ConcurrentInferenceParams,
+    ) -> List[int]:
+        request_id = "warmup-cfm-buckets"
+        async with self._feature_lock:
+            timbre = await asyncio.to_thread(
+                self._get_or_compute_timbre_features,
+                request_id,
+                target_audio_path,
+            )
+        return await asyncio.to_thread(self.cfm_scheduler.warmup_compile_buckets, timbre, params)
 
     async def convert(
         self,
