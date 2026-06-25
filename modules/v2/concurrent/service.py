@@ -82,6 +82,7 @@ class ARGenerateRequest:
     decode_steps: int = 0
     compiled_decode_steps: int = 0
     eager_decode_steps: int = 0
+    last_decode_route: str = ""
 
 
 @dataclass
@@ -184,12 +185,32 @@ class ARScheduler:
                 ",".join(str(batch_size) for batch_size in self.compiled_decode_fns),
                 self.max_slots,
             )
+        logger.info(
+            (
+                "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
+                "compile_requested=%s compile_enabled=%s compile_batches=%s profiling=%s"
+            ),
+            self.max_slots,
+            self.max_seq_len,
+            self.device,
+            self.dtype,
+            self.compile_decode_requested,
+            self.compile_decode_enabled,
+            ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
+            self.enable_profiling,
+        )
 
     async def start(self) -> None:
         if self._task is not None:
             return
         self._running = True
         self._task = asyncio.create_task(self._schedule_loop())
+        logger.info(
+            "stage=ar_scheduler_started max_slots=%s compile_enabled=%s compiled_batches=%s",
+            self.max_slots,
+            self.compile_decode_enabled,
+            ",".join(str(batch_size) for batch_size in sorted(self.compiled_decode_fns)) or "none",
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -266,10 +287,35 @@ class ARScheduler:
             logger.warning("stage=ar_compile_disabled reason=all_warmups_failed")
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+        logger.info(
+            (
+                "stage=warmup_ar_decode_summary requested_batches=%s warmed_batches=%s "
+                "enabled=%s remaining_batches=%s failures=%s"
+            ),
+            ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
+            ",".join(str(batch_size) for batch_size in warmed_batches) or "none",
+            self.compile_decode_enabled,
+            ",".join(str(batch_size) for batch_size in sorted(self.compiled_decode_fns)) or "none",
+            self.compile_failures,
+        )
         return warmed_batches
 
     async def submit(self, request: ARGenerateRequest) -> torch.Tensor:
         request.future = asyncio.get_running_loop().create_future()
+        request.queued_at = time.perf_counter()
+        logger.info(
+            (
+                "request=%s stage=ar_queue_submit chunk=%s queue_size=%s active=%s free_slots=%s "
+                "prompt_text_len=%s prompt_target_len=%s"
+            ),
+            request.request_id,
+            request.chunk_index,
+            self.waiting_queue.qsize(),
+            len(self.active),
+            len(self.free_slots),
+            request.prompt_text.size(1),
+            request.prompt_target.size(-1),
+        )
         await self.waiting_queue.put(request)
         return await request.future
 
@@ -307,6 +353,19 @@ class ARScheduler:
         request.slot_id = self.free_slots.pop(0)
         request.activated_at = time.perf_counter()
         self.active.append(request)
+        logger.info(
+            (
+                "request=%s stage=ar_request_activated chunk=%s slot=%s queue_wait_sec=%.3f "
+                "active=%s queue_size=%s free_slots=%s"
+            ),
+            request.request_id,
+            request.chunk_index,
+            request.slot_id,
+            request.activated_at - request.queued_at,
+            len(self.active),
+            self.waiting_queue.qsize(),
+            len(self.free_slots),
+        )
 
     @torch.no_grad()
     def _prefill_one(self, request: ARGenerateRequest) -> None:
@@ -403,17 +462,41 @@ class ARScheduler:
             compiled_decode_fn, decode_bucket = self._select_compiled_decode(len(group))
             decode_mode = "compiled" if compiled_decode_fn is not None else "eager"
             active_count = len(group)
+            padded_count = 0
             if compiled_decode_fn is not None and decode_bucket is not None and decode_bucket > len(group):
                 padded = self._pad_decode_batch(x, input_pos, kv_pos, slot_ids, decode_bucket, slot_ids_list)
                 if padded is None:
+                    if self.enable_profiling:
+                        logger.info(
+                            (
+                                "stage=ar_decode_padding_skipped active_count=%s bucket=%s free_slots=%s "
+                                "used_slots=%s route=eager"
+                            ),
+                            active_count,
+                            decode_bucket,
+                            len(self.free_slots),
+                            ",".join(str(slot_id) for slot_id in slot_ids_list),
+                        )
                     compiled_decode_fn = None
                     decode_bucket = None
                     decode_mode = "eager"
                 else:
                     x, input_pos, kv_pos, slot_ids = padded
+                    padded_count = int(x.size(0)) - active_count
             prepare_sec = self._profile_elapsed(profile_started_at)
             for request in group:
                 request.decode_prepare_sec += prepare_sec / len(group)
+            self._log_decode_route_if_changed(
+                group,
+                decode_mode=decode_mode,
+                active_count=active_count,
+                batch_size=int(x.size(0)),
+                decode_bucket=decode_bucket,
+                padded_count=padded_count,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+            )
 
             profile_started_at = self._profile_start()
             with self._autocast_context():
@@ -439,8 +522,14 @@ class ARScheduler:
                     if not self.compiled_decode_fns:
                         self.compile_decode_enabled = False
                     logger.warning(
-                        "stage=ar_decode_compile_fallback batch_size=%s error_type=%s error=%s",
+                        (
+                            "stage=ar_decode_compile_fallback batch_size=%s active_count=%s "
+                            "requests=%s chunks=%s error_type=%s error=%s"
+                        ),
                         decode_bucket,
+                        active_count,
+                        ",".join(request.request_id for request in group),
+                        ",".join(str(request.chunk_index) for request in group),
                         type(exc).__name__,
                         exc,
                     )
@@ -482,6 +571,46 @@ class ARScheduler:
                 request.decode_embed_sec += self._profile_elapsed(profile_started_at)
                 request.next_input_pos = request.next_input_pos + 1
                 request.next_kv_pos = request.next_kv_pos + 1
+
+    def _log_decode_route_if_changed(
+        self,
+        requests: Sequence[ARGenerateRequest],
+        *,
+        decode_mode: str,
+        active_count: int,
+        batch_size: int,
+        decode_bucket: Optional[int],
+        padded_count: int,
+        top_p: float,
+        temperature: float,
+        repetition_penalty: float,
+    ) -> None:
+        if not self.enable_profiling:
+            return
+        route_key = f"{decode_mode}:{active_count}:{batch_size}:{decode_bucket}:{padded_count}"
+        changed_requests = [request for request in requests if request.last_decode_route != route_key]
+        if not changed_requests:
+            return
+        for request in changed_requests:
+            request.last_decode_route = route_key
+        logger.info(
+            (
+                "stage=ar_decode_route mode=%s active_count=%s batch_size=%s bucket=%s padded=%s "
+                "free_slots=%s requests=%s chunks=%s slots=%s top_p=%.3f temperature=%.3f repetition_penalty=%.3f"
+            ),
+            decode_mode,
+            active_count,
+            batch_size,
+            decode_bucket if decode_bucket is not None else "none",
+            padded_count,
+            len(self.free_slots),
+            ",".join(request.request_id for request in requests),
+            ",".join(str(request.chunk_index) for request in requests),
+            ",".join(str(request.slot_id) for request in requests),
+            top_p,
+            temperature,
+            repetition_penalty,
+        )
 
     def _autocast_context(self):
         if self.device.type == "cuda" and self.dtype in (torch.float16, torch.bfloat16):
@@ -599,6 +728,21 @@ class ARScheduler:
         if request.future is not None and not request.future.done():
             request.future.set_exception(exc)
         self.failed += 1
+        logger.exception(
+            (
+                "request=%s stage=ar_request_failed chunk=%s slot=%s generated_tokens=%s "
+                "active=%s queue_size=%s free_slots=%s error_type=%s error=%s"
+            ),
+            request.request_id,
+            request.chunk_index,
+            request.slot_id,
+            len(request.generated_tokens),
+            len(self.active),
+            self.waiting_queue.qsize(),
+            len(self.free_slots),
+            type(exc).__name__,
+            exc,
+        )
 
     def metrics(self) -> Dict[str, int]:
         return {
