@@ -52,6 +52,7 @@ OUTPUT_MEDIA_TYPES = {
 }
 CLOUDFLARED_PUBLIC_URL_RE = re.compile(r"https://[-a-zA-Z0-9.]+trycloudflare\.com")
 CLOUDFLARED_PATH = Path(".tools") / "cloudflared"
+CLOUDFLARED_PROTOCOL = "http2"
 CLOUDFLARED_MAX_ATTEMPTS = 3
 CLOUDFLARED_RETRY_DELAY_SEC = 5.0
 MODEL_DIR = Path("models")
@@ -381,6 +382,8 @@ class ColabTunnel:
             [
                 self.cloudflared_path,
                 "tunnel",
+                "--protocol",
+                CLOUDFLARED_PROTOCOL,
                 "--url",
                 f"http://127.0.0.1:{self.port}",
             ],
@@ -417,7 +420,7 @@ def start_colab_tunnel(port: int) -> ColabTunnel:
     if cloudflared_path is None:
         raise RuntimeError("cloudflared is required for --colab mode")
 
-    print("Starting Cloudflare tunnel for Colab public access...", flush=True)
+    print(f"Starting Cloudflare tunnel for Colab public access (protocol={CLOUDFLARED_PROTOCOL})...", flush=True)
     return ColabTunnel(cloudflared_path, port).start()
 
 
