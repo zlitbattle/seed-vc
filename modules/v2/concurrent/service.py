@@ -224,6 +224,17 @@ class ARScheduler:
 
     def _build_compiled_decode_fns(self) -> None:
         self.compiled_decode_fns.clear()
+        compile_kwargs = {
+            "fullgraph": True,
+            "backend": "inductor",
+            "options": {"triton.cudagraphs": False},
+        }
+        logger.info(
+            "stage=ar_compile_config backend=%s mode=%s triton_cudagraphs=%s",
+            compile_kwargs["backend"],
+            compile_kwargs.get("mode"),
+            compile_kwargs.get("options", {}).get("triton.cudagraphs", "default"),
+        )
         for batch_size in self.compile_batch_sizes:
             batch_size = int(batch_size)
 
@@ -237,9 +248,7 @@ class ARScheduler:
 
             self.compiled_decode_fns[batch_size] = torch.compile(
                 decode_forward,
-                fullgraph=True,
-                backend="inductor",
-                mode="reduce-overhead",
+                **compile_kwargs,
             )
 
     @torch.no_grad()
