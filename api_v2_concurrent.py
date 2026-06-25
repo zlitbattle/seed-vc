@@ -466,6 +466,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfm-max-concurrent", type=int, default=1)
     parser.add_argument("--timbre-cache-size", type=int, default=20)
     parser.add_argument("--compile-cfm", action="store_true")
+    parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")
     return parser
 
@@ -483,6 +484,7 @@ async def initialize_service(args) -> None:
         ar_max_seq_len=args.ar_max_seq_len,
         timbre_cache_size=args.timbre_cache_size,
         cfm_max_concurrent=args.cfm_max_concurrent,
+        enable_profiling=args.enable_profiling,
     )
     await service.start()
 
