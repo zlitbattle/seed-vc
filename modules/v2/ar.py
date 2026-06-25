@@ -108,10 +108,15 @@ class KVCache(nn.Module):
             slot_ids = slot_ids.to(device=k_val.device, dtype=torch.long)
         assert slot_ids.numel() == k_val.size(0)
 
-        for batch_idx, slot_id in enumerate(slot_ids.tolist()):
-            positions = input_pos if input_pos.dim() == 1 else input_pos[batch_idx]
-            k_out[slot_id, :, positions] = k_val[batch_idx]
-            v_out[slot_id, :, positions] = v_val[batch_idx]
+        positions = input_pos.unsqueeze(0).expand(k_val.size(0), -1) if input_pos.dim() == 1 else input_pos
+        if positions.size(1) == 1:
+            pos = positions[:, 0]
+            k_out[slot_ids, :, pos] = k_val[:, :, 0, :]
+            v_out[slot_ids, :, pos] = v_val[:, :, 0, :]
+        else:
+            for batch_idx in range(k_val.size(0)):
+                k_out[slot_ids[batch_idx], :, positions[batch_idx]] = k_val[batch_idx]
+                v_out[slot_ids[batch_idx], :, positions[batch_idx]] = v_val[batch_idx]
 
         return k_out[slot_ids], v_out[slot_ids]
 
@@ -485,11 +490,17 @@ class NaiveWrapper(nn.Module):
             slot_ids: Union[Tensor, Sequence[int]],
             previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
             suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+            compiled_decode_fn = None,
+            active_count: Optional[int] = None,
             **sampling_kwargs,
     ) -> torch.Tensor:
-        result = self.model.forward_generate(x, input_pos, kv_pos, slot_ids=slot_ids)
+        if compiled_decode_fn is not None:
+            result = compiled_decode_fn(x, input_pos, kv_pos, slot_ids)
+        else:
+            result = self.model.forward_generate(x, input_pos, kv_pos, slot_ids=slot_ids)
+        sample_count = result.logits.size(0) if active_count is None else active_count
         sampled_tokens = []
-        for batch_idx in range(result.logits.size(0)):
+        for batch_idx in range(sample_count):
             prev = None
             if previous_tokens is not None:
                 prev = previous_tokens[batch_idx]

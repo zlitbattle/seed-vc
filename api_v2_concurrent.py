@@ -69,6 +69,7 @@ WARMUP_SOURCE_SEC = 20.0
 WARMUP_TARGET_SEC = 20.0
 WARMUP_AMPLITUDE = 0.02
 CFM_BUCKET_WARMUP_DIFFUSION_STEPS = 1
+FIXED_AR_SLOTS = 4
 
 
 def select_device() -> torch.device:
@@ -518,13 +519,20 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
     vc_wrapper.to(device)
     vc_wrapper.eval()
     vc_wrapper.setup_ar_caches(
-        max_batch_size=args.ar_slots,
+        max_batch_size=FIXED_AR_SLOTS,
         max_seq_len=args.ar_max_seq_len,
         dtype=dtype,
         device=device,
     )
-    if args.compile_cfm:
+    if args.ar_slots != FIXED_AR_SLOTS:
+        logger.warning(
+            "stage=ar_slots_fixed requested=%s using=%s",
+            args.ar_slots,
+            FIXED_AR_SLOTS,
+        )
+    if args.compile_ar or args.compile_cfm:
         configure_torch_compile()
+    if args.compile_cfm:
         vc_wrapper.compile_cfm()
     return vc_wrapper
 
@@ -595,6 +603,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ar-max-seq-len", type=int, default=4096)
     parser.add_argument("--cfm-max-concurrent", type=int, default=1)
     parser.add_argument("--timbre-cache-size", type=int, default=20)
+    parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument("--compile-cfm", action="store_true")
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")
@@ -610,12 +619,19 @@ async def initialize_service(args) -> None:
         vc_wrapper,
         device=device,
         dtype=dtype,
-        ar_slots=args.ar_slots,
+        ar_slots=FIXED_AR_SLOTS,
         ar_max_seq_len=args.ar_max_seq_len,
         timbre_cache_size=args.timbre_cache_size,
         cfm_max_concurrent=args.cfm_max_concurrent,
         enable_profiling=args.enable_profiling,
+        compile_ar=args.compile_ar,
     )
+    warmed_ar_batches = await service.warmup_ar_decode()
+    if warmed_ar_batches:
+        logger.info(
+            "stage=warmup_ar_decode_batches_done batches=%s",
+            ",".join(str(batch_size) for batch_size in warmed_ar_batches),
+        )
     await service.start()
     try:
         await run_startup_warmup(service)

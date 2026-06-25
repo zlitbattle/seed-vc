@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import librosa
 import numpy as np
@@ -80,6 +80,8 @@ class ARGenerateRequest:
     decode_step_sec: float = 0.0
     decode_embed_sec: float = 0.0
     decode_steps: int = 0
+    compiled_decode_steps: int = 0
+    eager_decode_steps: int = 0
 
 
 @dataclass
@@ -143,6 +145,8 @@ class ARScheduler:
         min_tokens_before_eos: int = 10,
         max_new_tokens: int = 4000,
         enable_profiling: bool = False,
+        compile_decode: bool = False,
+        compile_batch_sizes: Sequence[int] = (1, 2, 4),
     ):
         self.ar_wrapper = ar_wrapper
         self.device = device
@@ -152,6 +156,15 @@ class ARScheduler:
         self.min_tokens_before_eos = min_tokens_before_eos
         self.max_new_tokens = max_new_tokens
         self.enable_profiling = enable_profiling
+        self.compile_decode_requested = bool(compile_decode)
+        self.compile_decode_enabled = bool(compile_decode and device.type == "cuda" and hasattr(torch, "compile"))
+        self.compile_batch_sizes = tuple(sorted({
+            int(batch_size) for batch_size in compile_batch_sizes
+            if 1 <= int(batch_size) <= max_slots
+        }))
+        self.compiled_decode_fns: Dict[int, Callable] = {}
+        self.compile_failures = 0
+        self.compile_fallbacks = 0
         self.waiting_queue: "asyncio.Queue[ARGenerateRequest]" = asyncio.Queue()
         self.active: List[ARGenerateRequest] = []
         self.free_slots = list(range(max_slots))
@@ -159,6 +172,18 @@ class ARScheduler:
         self._running = False
         self.completed = 0
         self.failed = 0
+        if self.compile_decode_requested and not self.compile_decode_enabled:
+            logger.warning(
+                "stage=ar_compile_disabled reason=unsupported_device device=%s",
+                device,
+            )
+        if self.compile_decode_enabled:
+            self._build_compiled_decode_fns()
+            logger.info(
+                "stage=ar_compile_enabled batches=%s max_slots=%s",
+                ",".join(str(batch_size) for batch_size in self.compiled_decode_fns),
+                self.max_slots,
+            )
 
     async def start(self) -> None:
         if self._task is not None:
@@ -175,6 +200,73 @@ class ARScheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    def _build_compiled_decode_fns(self) -> None:
+        self.compiled_decode_fns.clear()
+        for batch_size in self.compile_batch_sizes:
+            batch_size = int(batch_size)
+
+            def decode_forward(x, input_pos, kv_pos, slot_ids):
+                return self.ar_wrapper.model.forward_generate(
+                    x,
+                    input_pos,
+                    kv_pos,
+                    slot_ids=slot_ids,
+                )
+
+            self.compiled_decode_fns[batch_size] = torch.compile(
+                decode_forward,
+                fullgraph=True,
+                backend="inductor",
+                mode="reduce-overhead",
+            )
+
+    @torch.no_grad()
+    def warmup_compiled_decode(self) -> List[int]:
+        if not self.compile_decode_enabled:
+            return []
+
+        warmed_batches = []
+        hidden_size = int(self.ar_wrapper.model.config.dim)
+        input_dtype = self.ar_wrapper.sep_token_emb.dtype
+        for batch_size, compiled_fn in list(self.compiled_decode_fns.items()):
+            started_at = time.perf_counter()
+            x = torch.zeros(
+                (batch_size, 1, hidden_size),
+                device=self.device,
+                dtype=input_dtype,
+            )
+            input_pos = torch.zeros((batch_size, 1), device=self.device, dtype=torch.long)
+            kv_pos = torch.zeros((batch_size, 1), device=self.device, dtype=torch.long)
+            slot_ids = torch.arange(batch_size, device=self.device, dtype=torch.long)
+            try:
+                logger.info("stage=warmup_ar_decode_start batch_size=%s", batch_size)
+                with self._autocast_context():
+                    result = compiled_fn(x, input_pos, kv_pos, slot_ids)
+                synchronize_device(self.device)
+                del result
+                warmed_batches.append(batch_size)
+                logger.info(
+                    "stage=warmup_ar_decode_done batch_size=%s elapsed_sec=%.3f",
+                    batch_size,
+                    time.perf_counter() - started_at,
+                )
+            except Exception as exc:
+                self.compile_failures += 1
+                self.compiled_decode_fns.pop(batch_size, None)
+                logger.warning(
+                    "stage=warmup_ar_decode_failed batch_size=%s error_type=%s error=%s",
+                    batch_size,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        if not self.compiled_decode_fns:
+            self.compile_decode_enabled = False
+            logger.warning("stage=ar_compile_disabled reason=all_warmups_failed")
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return warmed_batches
 
     async def submit(self, request: ARGenerateRequest) -> torch.Tensor:
         request.future = asyncio.get_running_loop().create_future()
@@ -299,33 +391,79 @@ class ARScheduler:
             x = torch.cat([request.last_emb for request in group], dim=0)
             input_pos = torch.stack([request.next_input_pos.reshape(()) for request in group], dim=0).view(-1, 1)
             kv_pos = torch.stack([request.next_kv_pos.reshape(()) for request in group], dim=0).view(-1, 1)
-            slot_ids = [request.slot_id for request in group]
+            if any(request.slot_id is None for request in group):
+                raise RuntimeError("AR request is missing slot_id during decode")
+            slot_ids_list = [int(request.slot_id) for request in group]
+            slot_ids = torch.tensor(slot_ids_list, device=self.device, dtype=torch.long)
             previous_tokens = [torch.stack([token.reshape(()) for token in request.generated_tokens]) for request in group]
             suppress_tokens = [
                 [eos_token] if len(request.generated_tokens) < self.min_tokens_before_eos else None
                 for request in group
             ]
+            compiled_decode_fn, decode_bucket = self._select_compiled_decode(len(group))
+            decode_mode = "compiled" if compiled_decode_fn is not None else "eager"
+            active_count = len(group)
+            if compiled_decode_fn is not None and decode_bucket is not None and decode_bucket > len(group):
+                padded = self._pad_decode_batch(x, input_pos, kv_pos, slot_ids, decode_bucket, slot_ids_list)
+                if padded is None:
+                    compiled_decode_fn = None
+                    decode_bucket = None
+                    decode_mode = "eager"
+                else:
+                    x, input_pos, kv_pos, slot_ids = padded
             prepare_sec = self._profile_elapsed(profile_started_at)
             for request in group:
                 request.decode_prepare_sec += prepare_sec / len(group)
 
             profile_started_at = self._profile_start()
             with self._autocast_context():
-                next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
-                    x,
-                    input_pos,
-                    kv_pos,
-                    slot_ids=slot_ids,
-                    previous_tokens=previous_tokens,
-                    suppress_tokens=suppress_tokens,
-                    top_p=top_p,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                )
+                try:
+                    next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
+                        x,
+                        input_pos,
+                        kv_pos,
+                        slot_ids=slot_ids,
+                        previous_tokens=previous_tokens,
+                        suppress_tokens=suppress_tokens,
+                        compiled_decode_fn=compiled_decode_fn,
+                        active_count=active_count,
+                        top_p=top_p,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+                except Exception as exc:
+                    if compiled_decode_fn is None or decode_bucket is None:
+                        raise
+                    self.compile_fallbacks += 1
+                    self.compiled_decode_fns.pop(decode_bucket, None)
+                    if not self.compiled_decode_fns:
+                        self.compile_decode_enabled = False
+                    logger.warning(
+                        "stage=ar_decode_compile_fallback batch_size=%s error_type=%s error=%s",
+                        decode_bucket,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
+                        torch.cat([request.last_emb for request in group], dim=0),
+                        torch.stack([request.next_input_pos.reshape(()) for request in group], dim=0).view(-1, 1),
+                        torch.stack([request.next_kv_pos.reshape(()) for request in group], dim=0).view(-1, 1),
+                        slot_ids=torch.tensor(slot_ids_list, device=self.device, dtype=torch.long),
+                        previous_tokens=previous_tokens,
+                        suppress_tokens=suppress_tokens,
+                        top_p=top_p,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+                    decode_mode = "eager_fallback"
             step_sec = self._profile_elapsed(profile_started_at)
             for request in group:
                 request.decode_step_sec += step_sec / len(group)
                 request.decode_steps += 1
+                if decode_mode == "compiled":
+                    request.compiled_decode_steps += 1
+                else:
+                    request.eager_decode_steps += 1
 
             for request, token in zip(group, next_tokens):
                 token = token.reshape(()).clone()
@@ -349,6 +487,47 @@ class ARScheduler:
         if self.device.type == "cuda" and self.dtype in (torch.float16, torch.bfloat16):
             return torch.autocast(device_type=self.device.type, dtype=self.dtype)
         return nullcontext()
+
+    def _select_compiled_decode(self, active_count: int) -> Tuple[Optional[Callable], Optional[int]]:
+        if not self.compile_decode_enabled:
+            return None, None
+        for batch_size in sorted(self.compiled_decode_fns):
+            if active_count <= batch_size:
+                return self.compiled_decode_fns[batch_size], batch_size
+        return None, None
+
+    def _pad_decode_batch(
+        self,
+        x: torch.Tensor,
+        input_pos: torch.Tensor,
+        kv_pos: torch.Tensor,
+        slot_ids: torch.Tensor,
+        batch_size: int,
+        used_slot_ids: Sequence[int],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        pad_count = batch_size - x.size(0)
+        if pad_count <= 0:
+            return x, input_pos, kv_pos, slot_ids
+
+        used_slots = set(int(slot_id) for slot_id in used_slot_ids)
+        dummy_slots = [slot_id for slot_id in self.free_slots if slot_id not in used_slots]
+        if len(dummy_slots) < pad_count:
+            return None
+
+        pad_x = torch.zeros(
+            (pad_count, *x.shape[1:]),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        pad_input_pos = input_pos[-1:].expand(pad_count, -1).clone()
+        pad_kv_pos = kv_pos[-1:].expand(pad_count, -1).clone()
+        pad_slot_ids = torch.tensor(dummy_slots[:pad_count], device=self.device, dtype=torch.long)
+        return (
+            torch.cat([x, pad_x], dim=0),
+            torch.cat([input_pos, pad_input_pos], dim=0),
+            torch.cat([kv_pos, pad_kv_pos], dim=0),
+            torch.cat([slot_ids, pad_slot_ids], dim=0),
+        )
 
     def _profile_start(self) -> float:
         if not self.enable_profiling:
@@ -382,7 +561,7 @@ class ARScheduler:
                 (
                     "request=%s stage=ar_chunk_done chunk=%s reason=%s slot=%s total_sec=%.3f "
                     "queue_wait_sec=%.3f prompt_text_len=%s prompt_target_len=%s generated_tokens=%s "
-                    "decode_steps=%s tokens_per_sec=%.2f prefill_build_sec=%.3f "
+                    "decode_steps=%s compiled_decode_steps=%s eager_decode_steps=%s tokens_per_sec=%.2f prefill_build_sec=%.3f "
                     "prefill_decode_sec=%.3f prefill_embed_sec=%.3f decode_prepare_sec=%.3f "
                     "decode_step_sec=%.3f decode_embed_sec=%.3f"
                 ),
@@ -396,6 +575,8 @@ class ARScheduler:
                 request.prompt_target.size(-1),
                 generated_tokens,
                 request.decode_steps,
+                request.compiled_decode_steps,
+                request.eager_decode_steps,
                 tokens_per_sec,
                 request.prefill_build_sec,
                 request.prefill_decode_sec,
@@ -427,6 +608,10 @@ class ARScheduler:
             "free_slots": len(self.free_slots),
             "completed": self.completed,
             "failed": self.failed,
+            "compile_decode_enabled": int(self.compile_decode_enabled),
+            "compiled_decode_batches": list(sorted(self.compiled_decode_fns)),
+            "compile_failures": self.compile_failures,
+            "compile_fallbacks": self.compile_fallbacks,
         }
 
 
@@ -811,6 +996,7 @@ class ConcurrentVoiceConversionService:
         timbre_cache_size: int = 20,
         cfm_max_concurrent: int = 1,
         enable_profiling: bool = False,
+        compile_ar: bool = False,
     ):
         self.vc_wrapper = vc_wrapper
         self.device = device
@@ -823,6 +1009,7 @@ class ConcurrentVoiceConversionService:
             max_slots=ar_slots,
             max_seq_len=ar_max_seq_len,
             enable_profiling=enable_profiling,
+            compile_decode=compile_ar,
         )
         self.cfm_scheduler = CFMScheduler(
             vc_wrapper,
@@ -855,6 +1042,9 @@ class ConcurrentVoiceConversionService:
                 target_audio_path,
             )
         return await self.cfm_scheduler.warmup_compile_buckets_async(timbre, params)
+
+    async def warmup_ar_decode(self) -> List[int]:
+        return self.ar_scheduler.warmup_compiled_decode()
 
     async def convert(
         self,
