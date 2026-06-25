@@ -161,6 +161,12 @@ class ARScheduler:
         self.compile_decode_requested = bool(compile_decode)
         self.compile_decode_enabled = bool(compile_decode and device.type == "cuda" and hasattr(torch, "compile"))
         self.compile_decode_cudagraphs = bool(compile_decode_cudagraphs)
+        if self.compile_decode_cudagraphs and self._is_t4_device():
+            logger.warning(
+                "stage=ar_compile_cudagraphs_disabled reason=t4_known_slow device=%s",
+                self._device_name(),
+            )
+            self.compile_decode_cudagraphs = False
         self.compile_batch_sizes = tuple(sorted({
             int(batch_size) for batch_size in compile_batch_sizes
             if 1 <= int(batch_size) <= max_slots
@@ -202,6 +208,24 @@ class ARScheduler:
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
             self.enable_profiling,
         )
+
+    def _device_name(self) -> str:
+        if self.device.type != "cuda":
+            return str(self.device)
+        try:
+            return torch.cuda.get_device_name(self.device)
+        except Exception:
+            return str(self.device)
+
+    def _is_t4_device(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        try:
+            major, minor = torch.cuda.get_device_capability(self.device)
+            device_name = torch.cuda.get_device_name(self.device).lower()
+        except Exception:
+            return False
+        return (major, minor) == (7, 5) and "t4" in device_name
 
     async def start(self) -> None:
         if self._task is not None:
