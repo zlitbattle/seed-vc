@@ -4,6 +4,7 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -126,12 +127,16 @@ class ARScheduler:
     def __init__(
         self,
         ar_wrapper,
+        device: torch.device,
+        dtype: torch.dtype,
         max_slots: int,
         max_seq_len: int = 4096,
         min_tokens_before_eos: int = 10,
         max_new_tokens: int = 4000,
     ):
         self.ar_wrapper = ar_wrapper
+        self.device = device
+        self.dtype = dtype
         self.max_slots = max_slots
         self.max_seq_len = max_seq_len
         self.min_tokens_before_eos = min_tokens_before_eos
@@ -202,29 +207,32 @@ class ARScheduler:
     @torch.no_grad()
     def _prefill_one(self, request: ARGenerateRequest) -> None:
         assert request.slot_id is not None
-        emb_seq, input_pos, kv_pos = self.ar_wrapper.build_generation_inputs(
-            request.prompt_text,
-            request.prompt_target,
-        )
+        with self._autocast_context():
+            emb_seq, input_pos, kv_pos = self.ar_wrapper.build_generation_inputs(
+                request.prompt_text,
+                request.prompt_target,
+            )
         if emb_seq.size(1) >= self.max_seq_len:
             raise RuntimeError(
                 f"AR prompt is too long: {emb_seq.size(1)} >= max_seq_len {self.max_seq_len}"
             )
 
         eos_token = self.ar_wrapper.model.config.vocab_size - 1
-        next_tokens = self.ar_wrapper.decode_one_token_ar(
-            emb_seq,
-            input_pos,
-            kv_pos,
-            slot_ids=[request.slot_id],
-            suppress_tokens=[eos_token],
-            top_p=request.params.top_p,
-            temperature=request.params.temperature,
-            repetition_penalty=request.params.repetition_penalty,
-        )
+        with self._autocast_context():
+            next_tokens = self.ar_wrapper.decode_one_token_ar(
+                emb_seq,
+                input_pos,
+                kv_pos,
+                slot_ids=[request.slot_id],
+                suppress_tokens=[eos_token],
+                top_p=request.params.top_p,
+                temperature=request.params.temperature,
+                repetition_penalty=request.params.repetition_penalty,
+            )
         token = next_tokens[0].reshape(()).clone()
         request.generated_tokens.append(token)
-        request.last_emb = self.ar_wrapper.embed_generated_token(token)
+        with self._autocast_context():
+            request.last_emb = self.ar_wrapper.embed_generated_token(token)
         request.next_input_pos = input_pos[-1:] + 1
         request.next_kv_pos = kv_pos[-1:] + 1
         request.is_prefilled = True
@@ -263,17 +271,18 @@ class ARScheduler:
                 for request in group
             ]
 
-            next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
-                x,
-                input_pos,
-                kv_pos,
-                slot_ids=slot_ids,
-                previous_tokens=previous_tokens,
-                suppress_tokens=suppress_tokens,
-                top_p=top_p,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-            )
+            with self._autocast_context():
+                next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
+                    x,
+                    input_pos,
+                    kv_pos,
+                    slot_ids=slot_ids,
+                    previous_tokens=previous_tokens,
+                    suppress_tokens=suppress_tokens,
+                    top_p=top_p,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                )
 
             for request, token in zip(group, next_tokens):
                 token = token.reshape(()).clone()
@@ -285,9 +294,15 @@ class ARScheduler:
                     continue
 
                 request.generated_tokens.append(token)
-                request.last_emb = self.ar_wrapper.embed_generated_token(token)
+                with self._autocast_context():
+                    request.last_emb = self.ar_wrapper.embed_generated_token(token)
                 request.next_input_pos = request.next_input_pos + 1
                 request.next_kv_pos = request.next_kv_pos + 1
+
+    def _autocast_context(self):
+        if self.device.type == "cuda" and self.dtype in (torch.float16, torch.bfloat16):
+            return torch.autocast(device_type=self.device.type, dtype=self.dtype)
+        return nullcontext()
 
     def _finish(self, request: ARGenerateRequest) -> None:
         if request in self.active:
@@ -713,6 +728,8 @@ class ConcurrentVoiceConversionService:
         self.enable_profiling = enable_profiling
         self.ar_scheduler = ARScheduler(
             vc_wrapper.ar,
+            device=device,
+            dtype=dtype,
             max_slots=ar_slots,
             max_seq_len=ar_max_seq_len,
         )
