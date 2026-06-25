@@ -61,6 +61,9 @@ CONTENT_EXTRACTOR_WIDE_CHECKPOINT_PATH = (
     MODEL_DIR / "astral-quantization" / "bsq2048" / "bsq2048_light.pth"
 )
 STYLE_ENCODER_CHECKPOINT_PATH = MODEL_DIR / "campplus" / "campplus_cn_common.bin"
+WARMUP_SOURCE_SEC = 10.0
+WARMUP_TARGET_SEC = 12.0
+WARMUP_AMPLITUDE = 0.02
 
 
 def select_device() -> torch.device:
@@ -487,6 +490,53 @@ async def initialize_service(args) -> None:
         enable_profiling=args.enable_profiling,
     )
     await service.start()
+    try:
+        await run_startup_warmup(service)
+    except Exception:
+        await service.stop()
+        raise
+
+
+async def run_startup_warmup(started_service: ConcurrentVoiceConversionService) -> None:
+    warmup_dir_path = Path(tempfile.mkdtemp(prefix="seed_vc_warmup_"))
+    warmup_started_at = time.perf_counter()
+    try:
+        source_path = warmup_dir_path / "warmup_source.wav"
+        target_path = warmup_dir_path / "warmup_target.wav"
+        sample_rate = int(started_service.vc_wrapper.sr)
+        write_warmup_audio(source_path, sample_rate, WARMUP_SOURCE_SEC, base_freq=220.0)
+        write_warmup_audio(target_path, sample_rate, WARMUP_TARGET_SEC, base_freq=330.0)
+        logger.info(
+            "stage=warmup_start source_sec=%.1f target_sec=%.1f sample_rate=%s",
+            WARMUP_SOURCE_SEC,
+            WARMUP_TARGET_SEC,
+            sample_rate,
+        )
+        request_id, output_sample_rate, waveform = await started_service.convert(
+            str(source_path),
+            str(target_path),
+            ConcurrentInferenceParams(),
+        )
+        logger.info(
+            "request=%s stage=warmup_done elapsed_sec=%.3f output_sample_rate=%s output_samples=%s",
+            request_id,
+            time.perf_counter() - warmup_started_at,
+            output_sample_rate,
+            len(waveform),
+        )
+        started_service.timbre_cache.clear()
+    finally:
+        shutil.rmtree(warmup_dir_path, ignore_errors=True)
+
+
+def write_warmup_audio(path: Path, sample_rate: int, duration_sec: float, base_freq: float) -> None:
+    sample_count = max(1, int(sample_rate * duration_sec))
+    timeline = np.arange(sample_count, dtype=np.float32) / sample_rate
+    waveform = WARMUP_AMPLITUDE * (
+        np.sin(2 * np.pi * base_freq * timeline)
+        + 0.35 * np.sin(2 * np.pi * base_freq * 1.5 * timeline)
+    )
+    sf.write(path, waveform.astype(np.float32), sample_rate)
 
 
 def main():

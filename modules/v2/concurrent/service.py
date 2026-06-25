@@ -104,6 +104,11 @@ class TimbreFeatureCache:
         while len(self._items) > self.max_size:
             self._items.popitem(last=False)
 
+    def clear(self) -> None:
+        self._items.clear()
+        self.hits = 0
+        self.misses = 0
+
     def metrics(self) -> Dict[str, float]:
         total = self.hits + self.misses
         hit_rate = self.hits / total if total else 0.0
