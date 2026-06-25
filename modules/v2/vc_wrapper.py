@@ -1,9 +1,13 @@
+import logging
+
 import torch
 import librosa
 import torchaudio
 import numpy as np
 from pathlib import Path
 from pydub import AudioSegment
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_DIR = Path("models")
 
@@ -113,12 +117,23 @@ class VoiceConversionWrapper(torch.nn.Module):
 
     def compile_cfm(self):
         self.prepare_cfm_for_compile()
-        self.cfm.estimator.transformer = torch.compile(
-            self.cfm.estimator.transformer,
-            fullgraph=True,
-            backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="reduce-overhead" if torch.cuda.is_available() else None,
+        compile_kwargs = {
+            "fullgraph": True,
+            "backend": "inductor" if torch.cuda.is_available() else "aot_eager",
+            "mode": "reduce-overhead" if torch.cuda.is_available() else None,
+        }
+        if torch.cuda.is_available():
+            # CFM runs inside a ThreadPoolExecutor in the concurrent API. Inductor
+            # CUDA Graph Trees can hit thread-local state assertions there, so keep
+            # the inductor graph but disable cudagraph capture for this compiled path.
+            compile_kwargs["options"] = {"triton.cudagraphs": False}
+        logger.info(
+            "stage=cfm_compile_config backend=%s mode=%s triton_cudagraphs=%s",
+            compile_kwargs["backend"],
+            compile_kwargs["mode"],
+            compile_kwargs.get("options", {}).get("triton.cudagraphs", "default"),
         )
+        self.cfm.estimator.transformer = torch.compile(self.cfm.estimator.transformer, **compile_kwargs)
         self.dit_compiled = True
 
     def prepare_cfm_for_compile(self):
