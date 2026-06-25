@@ -123,12 +123,23 @@ class VoiceConversionWrapper(torch.nn.Module):
 
     def prepare_cfm_for_compile(self):
         transformer = self.cfm.estimator.transformer
-        freqs_cis = getattr(transformer, "freqs_cis", None)
-        if freqs_cis is None or freqs_cis.dtype != torch.bfloat16:
+        freqs_cis = getattr(transformer, "freqs_cis", torch.empty(0))
+        if self._device_supports_native_bf16(freqs_cis.device):
             return
-        if freqs_cis.device.type == "cuda" and torch.cuda.is_bf16_supported():
-            return
-        transformer.freqs_cis = freqs_cis.to(dtype=torch.float32)
+
+        for module in transformer.modules():
+            for name, buffer in list(module.named_buffers(recurse=False)):
+                if buffer is None or buffer.dtype != torch.bfloat16:
+                    continue
+                persistent = name not in module._non_persistent_buffers_set
+                module.register_buffer(name, buffer.to(dtype=torch.float32), persistent=persistent)
+
+    @staticmethod
+    def _device_supports_native_bf16(device: torch.device) -> bool:
+        if device.type != "cuda":
+            return False
+        major, _ = torch.cuda.get_device_capability(device)
+        return major >= 8
 
     @staticmethod
     def _build_cfm_compile_buckets(compile_len: int) -> tuple[int, ...]:
