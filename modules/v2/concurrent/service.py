@@ -60,6 +60,7 @@ class SourceFeatures:
 @dataclass
 class ARGenerateRequest:
     request_id: str
+    chunk_index: int
     prompt_text: torch.Tensor
     prompt_target: torch.Tensor
     params: ConcurrentInferenceParams
@@ -70,7 +71,15 @@ class ARGenerateRequest:
     next_kv_pos: Optional[torch.Tensor] = None
     last_emb: Optional[torch.Tensor] = None
     generated_tokens: List[torch.Tensor] = field(default_factory=list)
-    started_at: float = field(default_factory=time.time)
+    queued_at: float = field(default_factory=time.perf_counter)
+    activated_at: float = 0.0
+    prefill_build_sec: float = 0.0
+    prefill_decode_sec: float = 0.0
+    prefill_embed_sec: float = 0.0
+    decode_prepare_sec: float = 0.0
+    decode_step_sec: float = 0.0
+    decode_embed_sec: float = 0.0
+    decode_steps: int = 0
 
 
 @dataclass
@@ -133,6 +142,7 @@ class ARScheduler:
         max_seq_len: int = 4096,
         min_tokens_before_eos: int = 10,
         max_new_tokens: int = 4000,
+        enable_profiling: bool = False,
     ):
         self.ar_wrapper = ar_wrapper
         self.device = device
@@ -141,6 +151,7 @@ class ARScheduler:
         self.max_seq_len = max_seq_len
         self.min_tokens_before_eos = min_tokens_before_eos
         self.max_new_tokens = max_new_tokens
+        self.enable_profiling = enable_profiling
         self.waiting_queue: "asyncio.Queue[ARGenerateRequest]" = asyncio.Queue()
         self.active: List[ARGenerateRequest] = []
         self.free_slots = list(range(max_slots))
@@ -202,22 +213,26 @@ class ARScheduler:
         if not self.free_slots:
             raise RuntimeError("AR slot exhausted")
         request.slot_id = self.free_slots.pop(0)
+        request.activated_at = time.perf_counter()
         self.active.append(request)
 
     @torch.no_grad()
     def _prefill_one(self, request: ARGenerateRequest) -> None:
         assert request.slot_id is not None
+        profile_started_at = self._profile_start()
         with self._autocast_context():
             emb_seq, input_pos, kv_pos = self.ar_wrapper.build_generation_inputs(
                 request.prompt_text,
                 request.prompt_target,
             )
+        request.prefill_build_sec += self._profile_elapsed(profile_started_at)
         if emb_seq.size(1) >= self.max_seq_len:
             raise RuntimeError(
                 f"AR prompt is too long: {emb_seq.size(1)} >= max_seq_len {self.max_seq_len}"
             )
 
         eos_token = self.ar_wrapper.model.config.vocab_size - 1
+        profile_started_at = self._profile_start()
         with self._autocast_context():
             next_tokens = self.ar_wrapper.decode_one_token_ar(
                 emb_seq,
@@ -229,20 +244,39 @@ class ARScheduler:
                 temperature=request.params.temperature,
                 repetition_penalty=request.params.repetition_penalty,
             )
+        request.prefill_decode_sec += self._profile_elapsed(profile_started_at)
         token = next_tokens[0].reshape(()).clone()
         request.generated_tokens.append(token)
+        profile_started_at = self._profile_start()
         with self._autocast_context():
             request.last_emb = self.ar_wrapper.embed_generated_token(token)
+        request.prefill_embed_sec += self._profile_elapsed(profile_started_at)
         request.next_input_pos = input_pos[-1:] + 1
         request.next_kv_pos = kv_pos[-1:] + 1
         request.is_prefilled = True
+        if self.enable_profiling:
+            logger.info(
+                (
+                    "request=%s stage=ar_prefill_done chunk=%s slot=%s prompt_text_len=%s "
+                    "prompt_target_len=%s kv_len=%s build_sec=%.3f decode_sec=%.3f embed_sec=%.3f"
+                ),
+                request.request_id,
+                request.chunk_index,
+                request.slot_id,
+                request.prompt_text.size(1),
+                request.prompt_target.size(-1),
+                emb_seq.size(1),
+                request.prefill_build_sec,
+                request.prefill_decode_sec,
+                request.prefill_embed_sec,
+            )
 
     @torch.no_grad()
     def _decode_one_step(self, requests: Sequence[ARGenerateRequest]) -> None:
         eos_token = self.ar_wrapper.model.config.vocab_size - 1
         for request in list(requests):
             if len(request.generated_tokens) >= self.max_new_tokens:
-                self._finish(request)
+                self._finish(request, reason="max_new_tokens")
 
         live_requests = [
             request for request in requests
@@ -261,6 +295,7 @@ class ARScheduler:
             groups.setdefault(key, []).append(request)
 
         for (top_p, temperature, repetition_penalty), group in groups.items():
+            profile_started_at = self._profile_start()
             x = torch.cat([request.last_emb for request in group], dim=0)
             input_pos = torch.stack([request.next_input_pos.reshape(()) for request in group], dim=0).view(-1, 1)
             kv_pos = torch.stack([request.next_kv_pos.reshape(()) for request in group], dim=0).view(-1, 1)
@@ -270,7 +305,11 @@ class ARScheduler:
                 [eos_token] if len(request.generated_tokens) < self.min_tokens_before_eos else None
                 for request in group
             ]
+            prepare_sec = self._profile_elapsed(profile_started_at)
+            for request in group:
+                request.decode_prepare_sec += prepare_sec / len(group)
 
+            profile_started_at = self._profile_start()
             with self._autocast_context():
                 next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
                     x,
@@ -283,6 +322,10 @@ class ARScheduler:
                     temperature=temperature,
                     repetition_penalty=repetition_penalty,
                 )
+            step_sec = self._profile_elapsed(profile_started_at)
+            for request in group:
+                request.decode_step_sec += step_sec / len(group)
+                request.decode_steps += 1
 
             for request, token in zip(group, next_tokens):
                 token = token.reshape(()).clone()
@@ -290,12 +333,15 @@ class ARScheduler:
                 reached_limit = len(request.generated_tokens) + 1 >= self.max_new_tokens
                 reached_cache_limit = int(request.next_kv_pos.item()) + 1 >= self.max_seq_len
                 if reached_eos or reached_limit or reached_cache_limit:
-                    self._finish(request)
+                    reason = "eos" if reached_eos else "max_new_tokens" if reached_limit else "cache_limit"
+                    self._finish(request, reason=reason)
                     continue
 
                 request.generated_tokens.append(token)
+                profile_started_at = self._profile_start()
                 with self._autocast_context():
                     request.last_emb = self.ar_wrapper.embed_generated_token(token)
+                request.decode_embed_sec += self._profile_elapsed(profile_started_at)
                 request.next_input_pos = request.next_input_pos + 1
                 request.next_kv_pos = request.next_kv_pos + 1
 
@@ -304,9 +350,22 @@ class ARScheduler:
             return torch.autocast(device_type=self.device.type, dtype=self.dtype)
         return nullcontext()
 
-    def _finish(self, request: ARGenerateRequest) -> None:
+    def _profile_start(self) -> float:
+        if not self.enable_profiling:
+            return 0.0
+        synchronize_device(self.device)
+        return time.perf_counter()
+
+    def _profile_elapsed(self, started_at: float) -> float:
+        if not self.enable_profiling:
+            return 0.0
+        synchronize_device(self.device)
+        return time.perf_counter() - started_at
+
+    def _finish(self, request: ARGenerateRequest, reason: str = "completed") -> None:
         if request in self.active:
             self.active.remove(request)
+        finished_at = time.perf_counter()
         if request.slot_id is not None:
             self.free_slots.append(request.slot_id)
             self.free_slots.sort()
@@ -314,6 +373,37 @@ class ARScheduler:
         if request.future is not None and not request.future.done():
             request.future.set_result(result)
         self.completed += 1
+        if self.enable_profiling:
+            total_sec = finished_at - request.activated_at if request.activated_at else finished_at - request.queued_at
+            queue_wait_sec = request.activated_at - request.queued_at if request.activated_at else 0.0
+            generated_tokens = len(request.generated_tokens)
+            tokens_per_sec = generated_tokens / total_sec if total_sec > 0 else 0.0
+            logger.info(
+                (
+                    "request=%s stage=ar_chunk_done chunk=%s reason=%s slot=%s total_sec=%.3f "
+                    "queue_wait_sec=%.3f prompt_text_len=%s prompt_target_len=%s generated_tokens=%s "
+                    "decode_steps=%s tokens_per_sec=%.2f prefill_build_sec=%.3f "
+                    "prefill_decode_sec=%.3f prefill_embed_sec=%.3f decode_prepare_sec=%.3f "
+                    "decode_step_sec=%.3f decode_embed_sec=%.3f"
+                ),
+                request.request_id,
+                request.chunk_index,
+                reason,
+                request.slot_id,
+                total_sec,
+                queue_wait_sec,
+                request.prompt_text.size(1),
+                request.prompt_target.size(-1),
+                generated_tokens,
+                request.decode_steps,
+                tokens_per_sec,
+                request.prefill_build_sec,
+                request.prefill_decode_sec,
+                request.prefill_embed_sec,
+                request.decode_prepare_sec,
+                request.decode_step_sec,
+                request.decode_embed_sec,
+            )
 
     def _fail_all(self, exc: Exception) -> None:
         for request in list(self.active):
@@ -732,6 +822,7 @@ class ConcurrentVoiceConversionService:
             dtype=dtype,
             max_slots=ar_slots,
             max_seq_len=ar_max_seq_len,
+            enable_profiling=enable_profiling,
         )
         self.cfm_scheduler = CFMScheduler(
             vc_wrapper,
@@ -795,19 +886,25 @@ class ConcurrentVoiceConversionService:
         if params.convert_style:
             ar_started_at = time.perf_counter()
             ar_outputs = []
-            for prompt_text, prompt_target in self._build_ar_chunks(source_features, timbre_features, params):
+            ar_chunks = self._build_ar_chunks(request_id, source_features, timbre_features, params)
+            for chunk_index, (prompt_text, prompt_target) in enumerate(ar_chunks):
                 ar_request = ARGenerateRequest(
                     request_id=request_id,
+                    chunk_index=chunk_index,
                     prompt_text=prompt_text,
                     prompt_target=prompt_target,
                     params=params,
                 )
                 ar_outputs.append(await self.ar_scheduler.submit(ar_request))
+            ar_sec = time.perf_counter() - ar_started_at
+            generated_tokens = sum(int(output.size(-1)) for output in ar_outputs)
             logger.info(
-                "request=%s stage=ar_done ar_sec=%.3f chunks=%s",
+                "request=%s stage=ar_done ar_sec=%.3f chunks=%s generated_tokens=%s tokens_per_sec=%.2f",
                 request_id,
-                time.perf_counter() - ar_started_at,
+                ar_sec,
                 len(ar_outputs),
+                generated_tokens,
+                generated_tokens / ar_sec if ar_sec > 0 else 0.0,
             )
 
         audio = await self.cfm_scheduler.submit(
@@ -1046,6 +1143,7 @@ class ConcurrentVoiceConversionService:
 
     def _build_ar_chunks(
         self,
+        request_id: str,
         source: SourceFeatures,
         timbre: TimbreFeatures,
         params: ConcurrentInferenceParams,
@@ -1072,6 +1170,20 @@ class ConcurrentVoiceConversionService:
                 with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                     prompt_text = self.vc_wrapper.ar_length_regulator(ar_tokens[None])[0]
             chunks.append((prompt_text, prompt_target))
+        if self.enable_profiling:
+            logger.info(
+                (
+                    "request=%s stage=ar_chunks_prepared chunks=%s source_narrow_len=%s target_prefix_len=%s "
+                    "max_chunk_size=%s prompt_target_len=%s anonymization_only=%s"
+                ),
+                request_id,
+                len(chunks),
+                int(source.source_narrow_reduced.numel()),
+                prefix_len,
+                max_chunk_size,
+                int(prompt_target.size(-1)),
+                params.anonymization_only,
+            )
         return chunks
 
     def metrics(self) -> Dict[str, Dict[str, float]]:
