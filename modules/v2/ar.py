@@ -506,6 +506,20 @@ class NaiveWrapper(nn.Module):
         else:
             result = self.model.forward_generate(x, input_pos, kv_pos, slot_ids=slot_ids)
         sample_count = result.logits.size(0) if active_count is None else active_count
+        if sample_count > 1:
+            batch_sampling_kwargs = sampling_kwargs.copy()
+            batch_suppress_tokens = suppress_tokens
+            if batch_suppress_tokens is None and "suppress_tokens" in batch_sampling_kwargs:
+                shared_suppress_tokens = batch_sampling_kwargs.pop("suppress_tokens")
+                batch_suppress_tokens = [shared_suppress_tokens for _ in range(sample_count)]
+            sampled, _ = sample_batch(
+                result.logits[:sample_count],
+                previous_tokens=previous_tokens,
+                suppress_tokens=batch_suppress_tokens,
+                **batch_sampling_kwargs,
+            )
+            return sampled.reshape(-1)
+
         sampled_tokens = []
         for batch_idx in range(sample_count):
             prev = None
@@ -836,6 +850,22 @@ def sample(
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
+
+def sample_batch(
+    logits,
+    previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+    **sampling_kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    probs = logits_to_probs_batch(
+        logits=logits[:, -1],
+        previous_tokens=previous_tokens,
+        suppress_tokens=suppress_tokens,
+        **sampling_kwargs,
+    )
+    idx_next = multinomial_sample_one_no_sync(probs)
+    return idx_next.reshape(-1), probs
+
 def multinomial_sample_one_no_sync(
     probs_sort,
 ):  # Does multinomial sampling without a cuda synchronization
@@ -875,5 +905,47 @@ def logits_to_probs(
 
     logits = logits / max(temperature, 1e-5)
 
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    return probs
+
+
+def logits_to_probs_batch(
+    logits,
+    previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+    temperature: torch.Tensor = 0.7,
+    top_p: torch.Tensor = 0.7,
+    repetition_penalty: torch.Tensor = 1.5,
+) -> torch.Tensor:
+    # Clone because repetition penalty and top-p filtering are applied in-place.
+    logits = logits.clone()
+
+    if previous_tokens is not None:
+        for batch_idx, tokens in enumerate(previous_tokens):
+            if tokens is None or tokens.numel() == 0:
+                continue
+            tokens = tokens.long()
+            row_logits = logits[batch_idx]
+            score = torch.gather(row_logits, dim=0, index=tokens)
+            score = torch.where(
+                score < 0, score * repetition_penalty, score / repetition_penalty
+            )
+            row_logits.scatter_(dim=0, index=tokens, src=score)
+
+    if suppress_tokens is not None:
+        for batch_idx, row_suppress_tokens in enumerate(suppress_tokens):
+            if row_suppress_tokens is not None:
+                logits[batch_idx, row_suppress_tokens] = -float("Inf")
+
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+    sorted_indices_to_remove = cum_probs > top_p
+    sorted_indices_to_remove[:, 0] = False
+    indices_to_remove = torch.zeros_like(sorted_indices_to_remove).scatter(
+        dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+    )
+    logits = logits.masked_fill(indices_to_remove, -float("Inf"))
+
+    logits = logits / max(temperature, 1e-5)
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
