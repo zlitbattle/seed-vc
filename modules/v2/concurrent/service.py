@@ -3,12 +3,12 @@ import hashlib
 import logging
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import librosa
 import numpy as np
@@ -19,8 +19,6 @@ logger = logging.getLogger(__name__)
 
 AR_DECODE_SAFETY_TOKENS = 64
 CFM_CHUNK_SAFETY_FRAMES = 16
-CFM_BATCH_MAX_SIZE = 4
-CFM_BATCH_WAIT_SEC = 0.18
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -879,7 +877,6 @@ class CFMScheduler:
         self.max_concurrent = max(1, max_concurrent)
         self.enable_profiling = enable_profiling
         self.queue: "asyncio.Queue[CFMJob]" = asyncio.Queue()
-        self._deferred_jobs: Deque[CFMJob] = deque()
         self._tasks: List[asyncio.Task] = []
         self._running = False
         self.active = 0
@@ -932,74 +929,39 @@ class CFMScheduler:
 
     async def _worker(self) -> None:
         while self._running:
-            job = await self._get_next_job()
-            jobs = await self._collect_batch_jobs(job)
-            self.active += len(jobs)
+            job = await self.queue.get()
+            self.active += 1
+            queue_wait_sec = time.perf_counter() - job.submitted_at
             run_started_at = time.perf_counter()
-            for batch_index, batch_job in enumerate(jobs):
-                queue_wait_sec = run_started_at - batch_job.submitted_at
+            logger.info(
+                "request=%s stage=cfm_start queue_wait_sec=%.3f active=%s queue_size=%s",
+                job.request_id,
+                queue_wait_sec,
+                self.active,
+                self.queue.qsize(),
+            )
+            try:
+                result = await self._run_in_executor(self._run_job, job)
+                if job.future is not None and not job.future.done():
+                    job.future.set_result(result)
+                self.completed += 1
                 logger.info(
-                    "request=%s stage=cfm_start queue_wait_sec=%.3f active=%s queue_size=%s batch_size=%s batch_index=%s",
-                    batch_job.request_id,
-                    queue_wait_sec,
-                    self.active,
-                    self.queue.qsize() + len(self._deferred_jobs),
-                    len(jobs),
-                    batch_index,
+                    "request=%s stage=cfm_done run_sec=%.3f completed=%s",
+                    job.request_id,
+                    time.perf_counter() - run_started_at,
+                    self.completed,
                 )
-            try:
-                results = await self._run_in_executor(self._run_jobs, jobs)
-                run_sec = time.perf_counter() - run_started_at
-                for batch_job, result in zip(jobs, results):
-                    if batch_job.future is not None and not batch_job.future.done():
-                        batch_job.future.set_result(result)
-                    self.completed += 1
-                    logger.info(
-                        "request=%s stage=cfm_done run_sec=%.3f completed=%s batch_size=%s",
-                        batch_job.request_id,
-                        run_sec,
-                        self.completed,
-                        len(jobs),
-                    )
             except Exception as exc:
-                for batch_job in jobs:
-                    if batch_job.future is not None and not batch_job.future.done():
-                        batch_job.future.set_exception(exc)
-                    self.failed += 1
-                    logger.exception(
-                        "request=%s stage=cfm_failed run_sec=%.3f batch_size=%s",
-                        batch_job.request_id,
-                        time.perf_counter() - run_started_at,
-                        len(jobs),
-                    )
+                if job.future is not None and not job.future.done():
+                    job.future.set_exception(exc)
+                self.failed += 1
+                logger.exception(
+                    "request=%s stage=cfm_failed run_sec=%.3f",
+                    job.request_id,
+                    time.perf_counter() - run_started_at,
+                )
             finally:
-                self.active -= len(jobs)
-
-    async def _get_next_job(self) -> CFMJob:
-        if self._deferred_jobs:
-            return self._deferred_jobs.popleft()
-        return await self.queue.get()
-
-    async def _collect_batch_jobs(self, first_job: CFMJob) -> List[CFMJob]:
-        if not self._is_batchable_style_job(first_job):
-            return [first_job]
-
-        jobs = [first_job]
-        deadline = time.perf_counter() + CFM_BATCH_WAIT_SEC
-        while len(jobs) < CFM_BATCH_MAX_SIZE:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                break
-            try:
-                next_job = await asyncio.wait_for(self.queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
-            if self._jobs_batch_compatible(first_job, next_job):
-                jobs.append(next_job)
-                continue
-            self._deferred_jobs.append(next_job)
-            break
-        return jobs
+                self.active -= 1
 
     async def _run_in_executor(self, func, *args):
         if self._executor is None:
@@ -1013,56 +975,6 @@ class CFMScheduler:
         if job.params.convert_style:
             return self._run_style_job(job)
         return self._run_timbre_job(job)
-
-    @torch.no_grad()
-    @torch.inference_mode()
-    def _run_jobs(self, jobs: Sequence[CFMJob]) -> List[Tuple[int, np.ndarray]]:
-        if len(jobs) > 1 and all(self._jobs_batch_compatible(jobs[0], job) for job in jobs):
-            return self._run_style_batch_jobs(jobs)
-        return [self._run_job(job) for job in jobs]
-
-    def _is_batchable_style_job(self, job: CFMJob) -> bool:
-        if not job.params.convert_style or not job.ar_outputs or len(job.ar_outputs) != 1:
-            return False
-        source = job.source_features
-        timbre = job.timbre_features
-        if source.source_content_indices.size(0) != 1:
-            return False
-        max_condition_len = int(self.vc_wrapper.cfm_compile_buckets[-1])
-        max_source_window = max(1, max_condition_len - int(timbre.target_mel_len))
-        ar_out = job.ar_outputs[0]
-        ar_out_mel_len = int(
-            source.source_mel_len
-            / max(1, source.source_content_indices.size(-1))
-            * ar_out.size(-1)
-            * job.params.length_adjust
-        )
-        return 0 < ar_out_mel_len <= max_source_window
-
-    def _jobs_batch_compatible(self, first: CFMJob, other: CFMJob) -> bool:
-        if not self._is_batchable_style_job(other):
-            return False
-        if not self._is_batchable_style_job(first):
-            return False
-        first_params = first.params
-        other_params = other.params
-        if (
-            first_params.diffusion_steps != other_params.diffusion_steps
-            or first_params.length_adjust != other_params.length_adjust
-            or first_params.intelligibility_cfg_rate != other_params.intelligibility_cfg_rate
-            or first_params.similarity_cfg_rate != other_params.similarity_cfg_rate
-            or first_params.anonymization_only != other_params.anonymization_only
-        ):
-            return False
-        first_timbre = first.timbre_features
-        other_timbre = other.timbre_features
-        return (
-            first_timbre.cache_key == other_timbre.cache_key
-            and int(first_timbre.target_mel_len) == int(other_timbre.target_mel_len)
-            and first_timbre.target_mel.shape == other_timbre.target_mel.shape
-            and first_timbre.prompt_condition.shape == other_timbre.prompt_condition.shape
-            and first_timbre.target_style.shape == other_timbre.target_style.shape
-        )
 
     def _run_timbre_job(self, job: CFMJob) -> Tuple[int, np.ndarray]:
         source = job.source_features
@@ -1083,99 +995,6 @@ class CFMScheduler:
                 source.source_mel_len,
             )
         return self._render_condition_chunks(job, cond)
-
-    def _run_style_batch_jobs(self, jobs: Sequence[CFMJob]) -> List[Tuple[int, np.ndarray]]:
-        if not jobs:
-            return []
-
-        first_timbre = jobs[0].timbre_features
-        target_mel_len = int(first_timbre.target_mel_len)
-        cat_conditions = []
-        original_lens = []
-        output_mel_lens = []
-
-        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-            for job in jobs:
-                source = job.source_features
-                ar_out = job.ar_outputs[0]
-                ar_out_mel_len = torch.LongTensor([
-                    int(
-                        source.source_mel_len
-                        / max(1, source.source_content_indices.size(-1))
-                        * ar_out.size(-1)
-                        * job.params.length_adjust
-                    )
-                ]).to(self.device)
-                chunk_cond, _ = self.vc_wrapper.cfm_length_regulator(ar_out, ylens=ar_out_mel_len)
-                cat_condition = torch.cat([job.timbre_features.prompt_condition, chunk_cond], dim=1)
-                original_lens.append(int(cat_condition.size(1)))
-                output_mel_lens.append(int(cat_condition.size(1)) - target_mel_len)
-                cat_conditions.append(cat_condition)
-
-            max_original_len = max(original_lens)
-            compile_bucket_len = max_original_len
-            if self.vc_wrapper.dit_compiled:
-                compile_bucket_len = self.vc_wrapper.select_cfm_compile_bucket(max_original_len)
-            padded_conditions = [
-                torch.nn.functional.pad(
-                    cat_condition,
-                    (0, 0, 0, compile_bucket_len - int(cat_condition.size(1))),
-                    value=0,
-                )
-                for cat_condition in cat_conditions
-            ]
-            batched_condition = torch.cat(padded_conditions, dim=0)
-            x_lens = torch.LongTensor(original_lens).to(self.device)
-            target_mel = torch.cat([job.timbre_features.target_mel for job in jobs], dim=0)
-            target_style = torch.cat([job.timbre_features.target_style for job in jobs], dim=0)
-            vc_mels = self.vc_wrapper.cfm.inference(
-                batched_condition,
-                x_lens,
-                target_mel,
-                target_style,
-                jobs[0].params.diffusion_steps,
-                inference_cfg_rate=[
-                    jobs[0].params.intelligibility_cfg_rate,
-                    jobs[0].params.similarity_cfg_rate,
-                ],
-                random_voice=jobs[0].params.anonymization_only,
-            )
-
-        results = []
-        overlap_wave_len = self.vc_wrapper.overlap_frame_len * self.vc_wrapper.hop_size
-        for index, job in enumerate(jobs):
-            vc_mel = vc_mels[index:index + 1, :, target_mel_len:original_lens[index]]
-            vc_wave = self.vc_wrapper.vocoder(vc_mel).squeeze()[None]
-            generated_wave_chunks = []
-            processed_frames, previous_chunk, should_break, _, full_audio = self.vc_wrapper._stream_wave_chunks(
-                vc_wave,
-                0,
-                vc_mel,
-                overlap_wave_len,
-                generated_wave_chunks,
-                None,
-                True,
-                stream_output=False,
-            )
-            if should_break:
-                waveform = full_audio
-            else:
-                waveform = np.concatenate(generated_wave_chunks)
-            results.append((self.vc_wrapper.sr, waveform))
-
-        if self.enable_profiling:
-            logger.info(
-                (
-                    "stage=cfm_batch_done batch_size=%s compile_bucket_len=%s original_lens=%s "
-                    "output_mel_lens=%s requests=%s"
-                ),
-                len(jobs),
-                compile_bucket_len,
-                ",".join(str(length) for length in original_lens),
-                ",".join(str(length) for length in output_mel_lens),
-                ",".join(job.request_id for job in jobs),
-            )
-        return results
 
     def _run_style_job(self, job: CFMJob) -> Tuple[int, np.ndarray]:
         if not job.ar_outputs:
