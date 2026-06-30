@@ -73,26 +73,27 @@ class CFM(torch.nn.Module):
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
         for step in range(1, len(t_span)):
+            t_batch = t.expand(x.size(0))
             if random_voice:
                 cfg_dphi_dt = self.estimator(
                     torch.cat([x, x], dim=0),
                     torch.cat([torch.zeros_like(prompt_x), torch.zeros_like(prompt_x)], dim=0),
                     torch.cat([x_lens, x_lens], dim=0),
-                    torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0),
+                    torch.cat([t_batch, t_batch], dim=0),
                     torch.cat([torch.zeros_like(style), torch.zeros_like(style)], dim=0),
                     torch.cat([mu, torch.zeros_like(mu)], dim=0),
                 )
                 cond_txt, uncond = cfg_dphi_dt.chunk(2, dim=0)
                 dphi_dt = ((1.0 + inference_cfg_rate[0]) * cond_txt - inference_cfg_rate[0] * uncond)
             elif all(i == 0 for i in inference_cfg_rate):
-                dphi_dt = self.estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu)
+                dphi_dt = self.estimator(x, prompt_x, x_lens, t_batch, style, mu)
             elif inference_cfg_rate[0] == 0:
                 # Classifier-Free Guidance inference introduced in VoiceBox
                 cfg_dphi_dt = self.estimator(
                     torch.cat([x, x], dim=0),
                     torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0),
                     torch.cat([x_lens, x_lens], dim=0),
-                    torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0),
+                    torch.cat([t_batch, t_batch], dim=0),
                     torch.cat([style, torch.zeros_like(style)], dim=0),
                     torch.cat([mu, mu], dim=0),
                 )
@@ -103,7 +104,7 @@ class CFM(torch.nn.Module):
                     torch.cat([x, x], dim=0),
                     torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0),
                     torch.cat([x_lens, x_lens], dim=0),
-                    torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0),
+                    torch.cat([t_batch, t_batch], dim=0),
                     torch.cat([style, torch.zeros_like(style)], dim=0),
                     torch.cat([mu, torch.zeros_like(mu)], dim=0),
                 )
@@ -115,7 +116,7 @@ class CFM(torch.nn.Module):
                     torch.cat([x, x, x], dim=0),
                     torch.cat([prompt_x, torch.zeros_like(prompt_x), torch.zeros_like(prompt_x)], dim=0),
                     torch.cat([x_lens, x_lens, x_lens], dim=0),
-                    torch.cat([t.unsqueeze(0), t.unsqueeze(0), t.unsqueeze(0)], dim=0),
+                    torch.cat([t_batch, t_batch, t_batch], dim=0),
                     torch.cat([style, torch.zeros_like(style), torch.zeros_like(style)], dim=0),
                     torch.cat([mu, mu, torch.zeros_like(mu)], dim=0),
                 )
