@@ -876,13 +876,14 @@ class CFMScheduler:
         if self._tasks:
             return
         self._running = True
+        executor_workers = 1 if self.vc_wrapper.dit_compiled else self.max_concurrent
         self._executor = ThreadPoolExecutor(
-            max_workers=self.max_concurrent,
+            max_workers=executor_workers,
             thread_name_prefix="seed-vc-cfm",
         )
         logger.info(
             "stage=cfm_executor_started workers=%s dit_compiled=%s",
-            self.max_concurrent,
+            executor_workers,
             self.vc_wrapper.dit_compiled,
         )
         for _ in range(self.max_concurrent):
