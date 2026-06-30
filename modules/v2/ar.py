@@ -496,6 +496,7 @@ class NaiveWrapper(nn.Module):
             kv_pos: torch.Tensor,
             slot_ids: Union[Tensor, Sequence[int]],
             previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
+            previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
             suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
             compiled_decode_fn = None,
             active_count: Optional[int] = None,
@@ -515,6 +516,7 @@ class NaiveWrapper(nn.Module):
             sampled, _ = sample_batch(
                 result.logits[:sample_count],
                 previous_tokens=previous_tokens,
+                previous_token_masks=previous_token_masks,
                 suppress_tokens=batch_suppress_tokens,
                 **batch_sampling_kwargs,
             )
@@ -854,12 +856,14 @@ def sample(
 def sample_batch(
     logits,
     previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
     suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
     **sampling_kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     probs = logits_to_probs_batch(
         logits=logits[:, -1],
         previous_tokens=previous_tokens,
+        previous_token_masks=previous_token_masks,
         suppress_tokens=suppress_tokens,
         **sampling_kwargs,
     )
@@ -912,6 +916,7 @@ def logits_to_probs(
 def logits_to_probs_batch(
     logits,
     previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
     suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
     temperature: torch.Tensor = 0.7,
     top_p: torch.Tensor = 0.7,
@@ -920,7 +925,15 @@ def logits_to_probs_batch(
     # Clone because repetition penalty and top-p filtering are applied in-place.
     logits = logits.clone()
 
-    if previous_tokens is not None:
+    if previous_token_masks is not None and all(mask is not None for mask in previous_token_masks):
+        token_mask = torch.stack(previous_token_masks, dim=0).to(device=logits.device, dtype=torch.bool)
+        penalized_logits = torch.where(
+            logits < 0,
+            logits * repetition_penalty,
+            logits / repetition_penalty,
+        )
+        logits = torch.where(token_mask, penalized_logits, logits)
+    elif previous_tokens is not None:
         for batch_idx, tokens in enumerate(previous_tokens):
             if tokens is None or tokens.numel() == 0:
                 continue

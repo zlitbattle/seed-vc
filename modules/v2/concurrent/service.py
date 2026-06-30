@@ -78,6 +78,7 @@ class ARGenerateRequest:
     generated_tokens: List[torch.Tensor] = field(default_factory=list)
     generated_token_buffer: Optional[torch.Tensor] = None
     generated_token_count: int = 0
+    previous_token_mask: Optional[torch.Tensor] = None
     queued_at: float = field(default_factory=time.perf_counter)
     activated_at: float = 0.0
     prefill_build_sec: float = 0.0
@@ -451,6 +452,12 @@ class ARScheduler:
         )
         request.generated_token_buffer[0] = token.long()
         request.generated_token_count = 1
+        request.previous_token_mask = torch.zeros(
+            (int(self.ar_wrapper.model.config.vocab_size),),
+            device=token.device,
+            dtype=torch.bool,
+        )
+        request.previous_token_mask[int(token.detach().cpu())] = True
         profile_started_at = self._profile_start()
         with self._autocast_context():
             request.last_emb = self.ar_wrapper.embed_generated_token(token)
@@ -519,6 +526,7 @@ class ARScheduler:
                 request.generated_token_buffer[:request.generated_token_count]
                 for request in group
             ]
+            previous_token_masks = [request.previous_token_mask for request in group]
             suppress_tokens = [
                 [eos_token] if request.generated_token_count < self.min_tokens_before_eos else None
                 for request in group
@@ -571,6 +579,7 @@ class ARScheduler:
                         kv_pos,
                         slot_ids=slot_ids,
                         previous_tokens=previous_tokens,
+                        previous_token_masks=previous_token_masks,
                         suppress_tokens=suppress_tokens,
                         compiled_decode_fn=compiled_decode_fn,
                         active_count=active_count,
@@ -611,6 +620,7 @@ class ARScheduler:
                         ),
                         slot_ids=torch.tensor(slot_ids_list, device=self.device, dtype=torch.long),
                         previous_tokens=previous_tokens,
+                        previous_token_masks=previous_token_masks,
                         suppress_tokens=suppress_tokens,
                         top_p=top_p,
                         temperature=temperature,
@@ -644,6 +654,8 @@ class ARScheduler:
                     raise RuntimeError("AR request is missing generated token buffer")
                 request.generated_token_buffer[request.generated_token_count] = token.long()
                 request.generated_token_count += 1
+                if request.previous_token_mask is not None:
+                    request.previous_token_mask[int(token_value)] = True
                 request.next_input_pos_value += 1
                 request.next_kv_pos_value += 1
                 embed_requests.append(request)
