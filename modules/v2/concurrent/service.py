@@ -72,8 +72,12 @@ class ARGenerateRequest:
     is_prefilled: bool = False
     next_input_pos: Optional[torch.Tensor] = None
     next_kv_pos: Optional[torch.Tensor] = None
+    next_input_pos_value: int = 0
+    next_kv_pos_value: int = 0
     last_emb: Optional[torch.Tensor] = None
     generated_tokens: List[torch.Tensor] = field(default_factory=list)
+    generated_token_buffer: Optional[torch.Tensor] = None
+    generated_token_count: int = 0
     queued_at: float = field(default_factory=time.perf_counter)
     activated_at: float = 0.0
     prefill_build_sec: float = 0.0
@@ -440,13 +444,19 @@ class ARScheduler:
             )
         request.prefill_decode_sec += self._profile_elapsed(profile_started_at)
         token = next_tokens[0].reshape(()).clone()
-        request.generated_tokens.append(token)
+        request.generated_token_buffer = torch.empty(
+            (self.max_new_tokens,),
+            device=token.device,
+            dtype=torch.long,
+        )
+        request.generated_token_buffer[0] = token.long()
+        request.generated_token_count = 1
         profile_started_at = self._profile_start()
         with self._autocast_context():
             request.last_emb = self.ar_wrapper.embed_generated_token(token)
         request.prefill_embed_sec += self._profile_elapsed(profile_started_at)
-        request.next_input_pos = input_pos[-1:] + 1
-        request.next_kv_pos = kv_pos[-1:] + 1
+        request.next_input_pos_value = int(input_pos[-1].detach().cpu()) + 1
+        request.next_kv_pos_value = int(kv_pos[-1].detach().cpu()) + 1
         request.is_prefilled = True
         if self.enable_profiling:
             logger.info(
@@ -469,12 +479,12 @@ class ARScheduler:
     def _decode_one_step(self, requests: Sequence[ARGenerateRequest]) -> None:
         eos_token = self.ar_wrapper.model.config.vocab_size - 1
         for request in list(requests):
-            if len(request.generated_tokens) >= self.max_new_tokens:
+            if request.generated_token_count >= self.max_new_tokens:
                 self._finish(request, reason="max_new_tokens")
 
         live_requests = [
             request for request in requests
-            if request in self.active and request.last_emb is not None and len(request.generated_tokens) < self.max_new_tokens
+            if request in self.active and request.last_emb is not None and request.generated_token_count < self.max_new_tokens
         ]
         if not live_requests:
             return
@@ -491,15 +501,26 @@ class ARScheduler:
         for (top_p, temperature, repetition_penalty), group in groups.items():
             profile_started_at = self._profile_start()
             x = torch.cat([request.last_emb for request in group], dim=0)
-            input_pos = torch.stack([request.next_input_pos.reshape(()) for request in group], dim=0).view(-1, 1)
-            kv_pos = torch.stack([request.next_kv_pos.reshape(()) for request in group], dim=0).view(-1, 1)
+            input_pos = torch.tensor(
+                [[request.next_input_pos_value] for request in group],
+                device=self.device,
+                dtype=torch.long,
+            )
+            kv_pos = torch.tensor(
+                [[request.next_kv_pos_value] for request in group],
+                device=self.device,
+                dtype=torch.long,
+            )
             if any(request.slot_id is None for request in group):
                 raise RuntimeError("AR request is missing slot_id during decode")
             slot_ids_list = [int(request.slot_id) for request in group]
             slot_ids = torch.tensor(slot_ids_list, device=self.device, dtype=torch.long)
-            previous_tokens = [torch.stack([token.reshape(()) for token in request.generated_tokens]) for request in group]
+            previous_tokens = [
+                request.generated_token_buffer[:request.generated_token_count]
+                for request in group
+            ]
             suppress_tokens = [
-                [eos_token] if len(request.generated_tokens) < self.min_tokens_before_eos else None
+                [eos_token] if request.generated_token_count < self.min_tokens_before_eos else None
                 for request in group
             ]
             compiled_decode_fn, decode_bucket = self._select_compiled_decode(len(group))
@@ -578,8 +599,16 @@ class ARScheduler:
                     )
                     next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
                         torch.cat([request.last_emb for request in group], dim=0),
-                        torch.stack([request.next_input_pos.reshape(()) for request in group], dim=0).view(-1, 1),
-                        torch.stack([request.next_kv_pos.reshape(()) for request in group], dim=0).view(-1, 1),
+                        torch.tensor(
+                            [[request.next_input_pos_value] for request in group],
+                            device=self.device,
+                            dtype=torch.long,
+                        ),
+                        torch.tensor(
+                            [[request.next_kv_pos_value] for request in group],
+                            device=self.device,
+                            dtype=torch.long,
+                        ),
                         slot_ids=torch.tensor(slot_ids_list, device=self.device, dtype=torch.long),
                         previous_tokens=previous_tokens,
                         suppress_tokens=suppress_tokens,
@@ -597,23 +626,27 @@ class ARScheduler:
                 else:
                     request.eager_decode_steps += 1
 
-            for request, token in zip(group, next_tokens):
+            next_token_values = next_tokens[:len(group)].detach().cpu().tolist()
+            for request, token, token_value in zip(group, next_tokens, next_token_values):
                 token = token.reshape(()).clone()
-                reached_eos = token.item() == eos_token and len(request.generated_tokens) >= self.min_tokens_before_eos
-                reached_limit = len(request.generated_tokens) + 1 >= self.max_new_tokens
-                reached_cache_limit = int(request.next_kv_pos.item()) + 1 >= self.max_seq_len
+                reached_eos = int(token_value) == eos_token and request.generated_token_count >= self.min_tokens_before_eos
+                reached_limit = request.generated_token_count + 1 >= self.max_new_tokens
+                reached_cache_limit = request.next_kv_pos_value + 1 >= self.max_seq_len
                 if reached_eos or reached_limit or reached_cache_limit:
                     reason = "eos" if reached_eos else "max_new_tokens" if reached_limit else "cache_limit"
                     self._finish(request, reason=reason)
                     continue
 
-                request.generated_tokens.append(token)
+                if request.generated_token_buffer is None:
+                    raise RuntimeError("AR request is missing generated token buffer")
+                request.generated_token_buffer[request.generated_token_count] = token.long()
+                request.generated_token_count += 1
                 profile_started_at = self._profile_start()
                 with self._autocast_context():
                     request.last_emb = self.ar_wrapper.embed_generated_token(token)
                 request.decode_embed_sec += self._profile_elapsed(profile_started_at)
-                request.next_input_pos = request.next_input_pos + 1
-                request.next_kv_pos = request.next_kv_pos + 1
+                request.next_input_pos_value += 1
+                request.next_kv_pos_value += 1
 
     def _log_decode_route_if_changed(
         self,
@@ -720,14 +753,19 @@ class ARScheduler:
         if request.slot_id is not None:
             self.free_slots.append(request.slot_id)
             self.free_slots.sort()
-        result = torch.stack([token.reshape(()) for token in request.generated_tokens], dim=0).long().unsqueeze(0)
+        if request.generated_token_buffer is not None and request.generated_token_count > 0:
+            result = request.generated_token_buffer[:request.generated_token_count].long().unsqueeze(0)
+        elif request.generated_tokens:
+            result = torch.stack([token.reshape(()) for token in request.generated_tokens], dim=0).long().unsqueeze(0)
+        else:
+            result = torch.empty((1, 0), device=self.device, dtype=torch.long)
         if request.future is not None and not request.future.done():
             request.future.set_result(result)
         self.completed += 1
         if self.enable_profiling:
             total_sec = finished_at - request.activated_at if request.activated_at else finished_at - request.queued_at
             queue_wait_sec = request.activated_at - request.queued_at if request.activated_at else 0.0
-            generated_tokens = len(request.generated_tokens)
+            generated_tokens = request.generated_token_count
             tokens_per_sec = generated_tokens / total_sec if total_sec > 0 else 0.0
             logger.info(
                 (
@@ -779,7 +817,7 @@ class ARScheduler:
             request.request_id,
             request.chunk_index,
             request.slot_id,
-            len(request.generated_tokens),
+            request.generated_token_count,
             len(self.active),
             self.waiting_queue.qsize(),
             len(self.free_slots),
