@@ -6,6 +6,7 @@ from .service import (
     ConcurrentInferenceParams,
     ConcurrentVoiceConversionService,
     SourceFeatures,
+    SourceFeatureCache,
     TimbreFeatures,
     TimbreFeatureCache,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ConcurrentInferenceParams",
     "ConcurrentVoiceConversionService",
     "SourceFeatures",
+    "SourceFeatureCache",
     "TimbreFeatures",
     "TimbreFeatureCache",
 ]

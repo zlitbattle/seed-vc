@@ -603,6 +603,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ar-max-seq-len", type=int, default=4096)
     parser.add_argument("--cfm-max-concurrent", type=int, default=1)
     parser.add_argument("--timbre-cache-size", type=int, default=20)
+    parser.add_argument("--source-cache-size", type=int, default=64)
+    parser.add_argument("--cfm-batch-max-size", type=int, default=4)
+    parser.add_argument("--cfm-batch-wait-sec", type=float, default=0.18)
     parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument(
         "--compile-ar-cudagraphs",
@@ -627,7 +630,10 @@ async def initialize_service(args) -> None:
         ar_slots=FIXED_AR_SLOTS,
         ar_max_seq_len=args.ar_max_seq_len,
         timbre_cache_size=args.timbre_cache_size,
+        source_cache_size=args.source_cache_size,
         cfm_max_concurrent=args.cfm_max_concurrent,
+        cfm_batch_max_size=args.cfm_batch_max_size,
+        cfm_batch_wait_sec=args.cfm_batch_wait_sec,
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
@@ -683,6 +689,7 @@ async def run_startup_warmup(started_service: ConcurrentVoiceConversionService) 
                 ",".join(str(bucket_len) for bucket_len in warmed_buckets),
             )
         started_service.timbre_cache.clear()
+        started_service.source_cache.clear()
     finally:
         shutil.rmtree(warmup_dir_path, ignore_errors=True)
 
