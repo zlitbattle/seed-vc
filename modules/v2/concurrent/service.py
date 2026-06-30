@@ -199,6 +199,8 @@ class ARScheduler:
         compile_decode: bool = False,
         compile_decode_cudagraphs: bool = False,
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
+        batch_wait_sec: float = 0.0,
+        feature_inflight_getter: Optional[Callable[[], int]] = None,
     ):
         self.ar_wrapper = ar_wrapper
         self.device = device
@@ -211,6 +213,9 @@ class ARScheduler:
         self.compile_decode_requested = bool(compile_decode)
         self.compile_decode_enabled = bool(compile_decode and device.type == "cuda" and hasattr(torch, "compile"))
         self.compile_decode_cudagraphs = bool(compile_decode_cudagraphs)
+        self.batch_wait_sec = max(0.0, float(batch_wait_sec))
+        self.feature_inflight_getter = feature_inflight_getter
+        self._batch_wait_logged = False
         if self.compile_decode_cudagraphs and self._is_t4_device():
             logger.warning(
                 "stage=ar_compile_cudagraphs_disabled reason=t4_known_slow device=%s",
@@ -246,7 +251,8 @@ class ARScheduler:
         logger.info(
             (
                 "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
-                "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s profiling=%s"
+                "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s "
+                "batch_wait_sec=%.3f profiling=%s"
             ),
             self.max_slots,
             self.max_seq_len,
@@ -256,6 +262,7 @@ class ARScheduler:
             self.compile_decode_enabled,
             self.compile_decode_cudagraphs,
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
+            self.batch_wait_sec,
             self.enable_profiling,
         )
 
@@ -417,6 +424,10 @@ class ARScheduler:
                     request = await self.waiting_queue.get()
                     self._activate(request)
 
+                if self._should_wait_for_feature_batch():
+                    await asyncio.sleep(0.001)
+                    continue
+
                 for request in list(self.active):
                     if not request.is_prefilled:
                         self._prefill_one(request)
@@ -457,6 +468,38 @@ class ARScheduler:
             self.waiting_queue.qsize(),
             len(self.free_slots),
         )
+
+    def _should_wait_for_feature_batch(self) -> bool:
+        if self.batch_wait_sec <= 0 or not self.active or not self.free_slots:
+            self._batch_wait_logged = False
+            return False
+
+        feature_inflight = self.feature_inflight_getter() if self.feature_inflight_getter is not None else 0
+        if feature_inflight <= 0:
+            self._batch_wait_logged = False
+            return False
+
+        first_activated_at = min(
+            request.activated_at for request in self.active if request.activated_at
+        )
+        waited_sec = time.perf_counter() - first_activated_at
+        should_wait = waited_sec < self.batch_wait_sec
+        if should_wait and not self._batch_wait_logged:
+            self._batch_wait_logged = True
+            logger.info(
+                (
+                    "stage=ar_batch_wait active=%s free_slots=%s feature_inflight=%s "
+                    "waited_sec=%.3f max_wait_sec=%.3f"
+                ),
+                len(self.active),
+                len(self.free_slots),
+                feature_inflight,
+                waited_sec,
+                self.batch_wait_sec,
+            )
+        if not should_wait:
+            self._batch_wait_logged = False
+        return should_wait
 
     @torch.no_grad()
     def _prefill_one(self, request: ARGenerateRequest) -> None:
@@ -1530,6 +1573,7 @@ class ConcurrentVoiceConversionService:
         cfm_batch_max_size: int = CFM_BATCH_MAX_SIZE,
         cfm_batch_wait_sec: float = CFM_BATCH_WAIT_SEC,
         feature_max_concurrent: int = 1,
+        ar_batch_wait_sec: float = 0.0,
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
@@ -1539,6 +1583,7 @@ class ConcurrentVoiceConversionService:
         self.dtype = dtype
         self.enable_profiling = enable_profiling
         self.feature_max_concurrent = max(1, int(feature_max_concurrent))
+        self._feature_inflight = 0
         self.ar_scheduler = ARScheduler(
             vc_wrapper.ar,
             device=device,
@@ -1548,6 +1593,8 @@ class ConcurrentVoiceConversionService:
             enable_profiling=enable_profiling,
             compile_decode=compile_ar,
             compile_decode_cudagraphs=compile_ar_cudagraphs,
+            batch_wait_sec=ar_batch_wait_sec,
+            feature_inflight_getter=self._get_feature_inflight,
         )
         self.cfm_scheduler = CFMScheduler(
             vc_wrapper,
@@ -1563,6 +1610,9 @@ class ConcurrentVoiceConversionService:
         self._feature_semaphore = asyncio.Semaphore(self.feature_max_concurrent)
         self._source_inflight_lock = asyncio.Lock()
         self._inflight_source_features: Dict[str, asyncio.Task] = {}
+
+    def _get_feature_inflight(self) -> int:
+        return self._feature_inflight
 
     async def start(self) -> None:
         await self.ar_scheduler.start()
@@ -1672,36 +1722,40 @@ class ConcurrentVoiceConversionService:
         target_audio_path: str,
         require_source_narrow: bool,
     ) -> Tuple[SourceFeatures, TimbreFeatures, float]:
-        timbre_started_at = time.perf_counter()
-        feature_lock_wait_started_at = time.perf_counter()
-        async with self._feature_semaphore:
-            feature_lock_wait_sec = time.perf_counter() - feature_lock_wait_started_at
-            timbre = await asyncio.to_thread(
-                self._get_or_compute_timbre_features,
+        self._feature_inflight += 1
+        try:
+            timbre_started_at = time.perf_counter()
+            feature_lock_wait_started_at = time.perf_counter()
+            async with self._feature_semaphore:
+                feature_lock_wait_sec = time.perf_counter() - feature_lock_wait_started_at
+                timbre = await asyncio.to_thread(
+                    self._get_or_compute_timbre_features,
+                    request_id,
+                    target_audio_path,
+                )
+            logger.info(
+                "request=%s stage=timbre_done elapsed_sec=%.3f cache_key=%s",
                 request_id,
-                target_audio_path,
+                time.perf_counter() - timbre_started_at,
+                timbre.cache_key,
             )
-        logger.info(
-            "request=%s stage=timbre_done elapsed_sec=%.3f cache_key=%s",
-            request_id,
-            time.perf_counter() - timbre_started_at,
-            timbre.cache_key,
-        )
 
-        source_started_at = time.perf_counter()
-        source = await self._get_or_compute_source_features_async(
-            request_id,
-            source_audio_path,
-            require_source_narrow,
-        )
-        logger.info(
-            "request=%s stage=source_features_done elapsed_sec=%.3f source_mel_len=%s require_narrow=%s",
-            request_id,
-            time.perf_counter() - source_started_at,
-            source.source_mel_len,
-            require_source_narrow,
-        )
-        return source, timbre, feature_lock_wait_sec
+            source_started_at = time.perf_counter()
+            source = await self._get_or_compute_source_features_async(
+                request_id,
+                source_audio_path,
+                require_source_narrow,
+            )
+            logger.info(
+                "request=%s stage=source_features_done elapsed_sec=%.3f source_mel_len=%s require_narrow=%s",
+                request_id,
+                time.perf_counter() - source_started_at,
+                source.source_mel_len,
+                require_source_narrow,
+            )
+            return source, timbre, feature_lock_wait_sec
+        finally:
+            self._feature_inflight = max(0, self._feature_inflight - 1)
 
     async def _get_or_compute_source_features_async(
         self,
@@ -2179,5 +2233,6 @@ class ConcurrentVoiceConversionService:
             "source_cache": self.source_cache.metrics(),
             "feature_extraction": {
                 "max_concurrent": self.feature_max_concurrent,
+                "inflight": self._feature_inflight,
             },
         }

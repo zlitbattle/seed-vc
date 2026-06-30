@@ -607,6 +607,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfm-batch-max-size", type=int, default=4)
     parser.add_argument("--cfm-batch-wait-sec", type=float, default=0.18)
     parser.add_argument("--feature-max-concurrent", type=int, default=1)
+    parser.add_argument(
+        "--ar-batch-wait-sec",
+        type=float,
+        default=0.0,
+        help="Wait briefly for in-flight feature extraction before AR decode batching",
+    )
     parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument(
         "--compile-ar-cudagraphs",
@@ -636,6 +642,7 @@ async def initialize_service(args) -> None:
         cfm_batch_max_size=args.cfm_batch_max_size,
         cfm_batch_wait_sec=args.cfm_batch_wait_sec,
         feature_max_concurrent=args.feature_max_concurrent,
+        ar_batch_wait_sec=args.ar_batch_wait_sec,
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
