@@ -1323,17 +1323,20 @@ class ConcurrentVoiceConversionService:
         ar_outputs = None
         if params.convert_style:
             ar_started_at = time.perf_counter()
-            ar_outputs = []
             ar_chunks = self._build_ar_chunks(request_id, source_features, timbre_features, params)
-            for chunk_index, (prompt_text, prompt_target) in enumerate(ar_chunks):
-                ar_request = ARGenerateRequest(
+            ar_requests = [
+                ARGenerateRequest(
                     request_id=request_id,
                     chunk_index=chunk_index,
                     prompt_text=prompt_text,
                     prompt_target=prompt_target,
                     params=params,
                 )
-                ar_outputs.append(await self.ar_scheduler.submit(ar_request))
+                for chunk_index, (prompt_text, prompt_target) in enumerate(ar_chunks)
+            ]
+            ar_outputs = await asyncio.gather(*(
+                self.ar_scheduler.submit(ar_request) for ar_request in ar_requests
+            ))
             ar_sec = time.perf_counter() - ar_started_at
             generated_tokens = sum(int(output.size(-1)) for output in ar_outputs)
             logger.info(
