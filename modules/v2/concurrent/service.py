@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 AR_DECODE_SAFETY_TOKENS = 64
 CFM_CHUNK_SAFETY_FRAMES = 16
 CFM_BATCH_MAX_SIZE = 4
-CFM_BATCH_WAIT_SEC = 0.32
+CFM_BATCH_WAIT_SEC = 0.18
 
 
 def synchronize_device(device: torch.device) -> None:
