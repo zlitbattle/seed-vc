@@ -17,6 +17,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+AR_DECODE_SAFETY_TOKENS = 64
+CFM_CHUNK_SAFETY_FRAMES = 16
+
 
 def synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
@@ -941,11 +944,12 @@ class CFMScheduler:
         previous_chunk = None
         processed_frames = 0
         overlap_wave_len = self.vc_wrapper.overlap_frame_len * self.vc_wrapper.hop_size
+        max_condition_len = int(self.vc_wrapper.cfm_compile_buckets[-1])
 
         source = job.source_features
         timbre = job.timbre_features
+        max_source_window = max(1, max_condition_len - int(timbre.target_mel_len))
         for index, ar_out in enumerate(job.ar_outputs):
-            is_last_chunk = index + 1 >= len(job.ar_outputs)
             ar_out_mel_len = torch.LongTensor([
                 int(
                     source.source_mel_len
@@ -956,23 +960,33 @@ class CFMScheduler:
             ]).to(self.device)
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 chunk_cond, _ = self.vc_wrapper.cfm_length_regulator(ar_out, ylens=ar_out_mel_len)
-                cat_condition = torch.cat([timbre.prompt_condition, chunk_cond], dim=1)
-                original_len = cat_condition.size(1)
-                vc_mel, _, _ = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
-            vc_mel = vc_mel[:, :, timbre.target_mel_len:original_len]
-            vc_wave = self.vc_wrapper.vocoder(vc_mel).squeeze()[None]
-            processed_frames, previous_chunk, should_break, _, full_audio = self.vc_wrapper._stream_wave_chunks(
-                vc_wave,
-                processed_frames,
-                vc_mel,
-                overlap_wave_len,
-                generated_wave_chunks,
-                previous_chunk,
-                is_last_chunk,
-                stream_output=False,
-            )
-            if should_break:
-                return self.vc_wrapper.sr, full_audio
+
+            chunk_offset = 0
+            while chunk_offset < chunk_cond.size(1):
+                cond_slice = chunk_cond[:, chunk_offset:chunk_offset + max_source_window]
+                is_last_chunk = (
+                    index + 1 >= len(job.ar_outputs)
+                    and chunk_offset + max_source_window >= chunk_cond.size(1)
+                )
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    cat_condition = torch.cat([timbre.prompt_condition, cond_slice], dim=1)
+                    original_len = cat_condition.size(1)
+                    vc_mel, _, _ = self._infer_cfm(job, cat_condition, random_voice=job.params.anonymization_only)
+                vc_mel = vc_mel[:, :, timbre.target_mel_len:original_len]
+                vc_wave = self.vc_wrapper.vocoder(vc_mel).squeeze()[None]
+                processed_frames, previous_chunk, should_break, _, full_audio = self.vc_wrapper._stream_wave_chunks(
+                    vc_wave,
+                    processed_frames,
+                    vc_mel,
+                    overlap_wave_len,
+                    generated_wave_chunks,
+                    previous_chunk,
+                    is_last_chunk,
+                    stream_output=False,
+                )
+                if should_break:
+                    return self.vc_wrapper.sr, full_audio
+                chunk_offset += max_source_window
         return self.vc_wrapper.sr, np.concatenate(generated_wave_chunks)
 
     def _render_condition_chunks(self, job: CFMJob, cond: torch.Tensor) -> Tuple[int, np.ndarray]:
@@ -1513,6 +1527,150 @@ class ConcurrentVoiceConversionService:
             source_narrow_reduced=source_narrow_reduced,
         )
 
+    def _style_cfm_source_token_budget(
+        self,
+        source: SourceFeatures,
+        timbre: TimbreFeatures,
+        params: ConcurrentInferenceParams,
+    ) -> int:
+        if source.source_narrow_reduced is None or source.source_narrow_reduced.numel() <= 0:
+            return 1
+
+        max_condition_len = int(self.vc_wrapper.cfm_compile_buckets[-1])
+        source_frame_budget = max(1, max_condition_len - int(timbre.target_mel_len) - CFM_CHUNK_SAFETY_FRAMES)
+        frames_per_narrow_token = max(
+            float(source.source_mel_len) / max(1, int(source.source_narrow_reduced.numel())),
+            1e-6,
+        )
+        length_adjust = max(float(params.length_adjust), 1e-6)
+        return max(1, int(source_frame_budget / frames_per_narrow_token / length_adjust))
+
+    def _build_ar_prompt_text(
+        self,
+        target_prefix: torch.Tensor,
+        source_chunk: torch.Tensor,
+        anonymization_only: bool,
+    ) -> torch.Tensor:
+        if anonymization_only:
+            ar_tokens = source_chunk
+        else:
+            ar_tokens = torch.cat([target_prefix, source_chunk], dim=0)
+        with torch.no_grad():
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                return self.vc_wrapper.ar_length_regulator(ar_tokens[None])[0]
+
+    def _ar_prompt_sequence_len(self, prompt_text: torch.Tensor, prompt_target: torch.Tensor) -> int:
+        # build_generation_inputs inserts two separator embeddings around prompt_text.
+        return int(prompt_text.size(1)) + int(prompt_target.size(-1)) + 2
+
+    def _ar_chunk_has_decode_room(
+        self,
+        prompt_text: torch.Tensor,
+        prompt_target: torch.Tensor,
+        source_chunk_len: int,
+    ) -> bool:
+        prompt_seq_len = self._ar_prompt_sequence_len(prompt_text, prompt_target)
+        generation_reserve = max(
+            int(self.ar_scheduler.min_tokens_before_eos) + AR_DECODE_SAFETY_TOKENS,
+            int(source_chunk_len) + AR_DECODE_SAFETY_TOKENS,
+        )
+        return prompt_seq_len + generation_reserve < int(self.ar_scheduler.max_seq_len)
+
+    def _fit_ar_target_context(
+        self,
+        request_id: str,
+        source_tokens: torch.Tensor,
+        target_prefix: torch.Tensor,
+        prompt_target: torch.Tensor,
+        anonymization_only: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if anonymization_only or source_tokens.numel() <= 0:
+            return target_prefix, prompt_target
+
+        original_prefix_len = int(target_prefix.numel())
+        original_prompt_target_len = int(prompt_target.size(-1))
+        min_decode_room = int(self.ar_scheduler.min_tokens_before_eos) + AR_DECODE_SAFETY_TOKENS
+        first_source_token = source_tokens[:1]
+
+        while True:
+            prompt_text = self._build_ar_prompt_text(target_prefix, first_source_token, anonymization_only=False)
+            prompt_seq_len = self._ar_prompt_sequence_len(prompt_text, prompt_target)
+            if prompt_seq_len + min_decode_room < int(self.ar_scheduler.max_seq_len):
+                break
+
+            overflow = prompt_seq_len + min_decode_room - int(self.ar_scheduler.max_seq_len) + 1
+            if int(prompt_target.size(-1)) > 0:
+                trim = min(int(prompt_target.size(-1)), max(1, overflow))
+                prompt_target = prompt_target[:, : int(prompt_target.size(-1)) - trim]
+                continue
+            if int(target_prefix.numel()) > 0:
+                trim = min(int(target_prefix.numel()), max(1, overflow))
+                target_prefix = target_prefix[: int(target_prefix.numel()) - trim]
+                continue
+            break
+
+        if original_prefix_len != int(target_prefix.numel()) or original_prompt_target_len != int(prompt_target.size(-1)):
+            logger.warning(
+                (
+                    "request=%s stage=ar_target_context_trimmed original_target_prefix_len=%s "
+                    "target_prefix_len=%s original_prompt_target_len=%s prompt_target_len=%s max_seq_len=%s"
+                ),
+                request_id,
+                original_prefix_len,
+                int(target_prefix.numel()),
+                original_prompt_target_len,
+                int(prompt_target.size(-1)),
+                int(self.ar_scheduler.max_seq_len),
+            )
+        return target_prefix, prompt_target
+
+    def _fit_ar_chunk(
+        self,
+        target_prefix: torch.Tensor,
+        prompt_target: torch.Tensor,
+        source_tokens: torch.Tensor,
+        start: int,
+        max_chunk_size: int,
+        anonymization_only: bool,
+    ) -> Tuple[int, torch.Tensor]:
+        low = 1
+        high = max(1, int(max_chunk_size))
+        best_size = 0
+        best_prompt_text = None
+
+        while low <= high:
+            mid = (low + high) // 2
+            source_chunk = source_tokens[start:start + mid]
+            prompt_text = self._build_ar_prompt_text(target_prefix, source_chunk, anonymization_only)
+            if self._ar_chunk_has_decode_room(prompt_text, prompt_target, int(source_chunk.numel())):
+                best_size = mid
+                best_prompt_text = prompt_text
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if best_prompt_text is not None:
+            return best_size, best_prompt_text
+
+        source_chunk = source_tokens[start:start + 1]
+        prompt_text = self._build_ar_prompt_text(target_prefix, source_chunk, anonymization_only)
+        prompt_seq_len = self._ar_prompt_sequence_len(prompt_text, prompt_target)
+        if prompt_seq_len < int(self.ar_scheduler.max_seq_len):
+            logger.warning(
+                (
+                    "stage=ar_chunk_decode_room_low prompt_seq_len=%s max_seq_len=%s "
+                    "source_chunk_len=1"
+                ),
+                prompt_seq_len,
+                int(self.ar_scheduler.max_seq_len),
+            )
+            return 1, prompt_text
+
+        raise RuntimeError(
+            f"AR prompt is too long even after adaptive chunking: "
+            f"{prompt_seq_len} >= max_seq_len {self.ar_scheduler.max_seq_len}"
+        )
+
     def _synchronize_for_profiling(self) -> None:
         if self.enable_profiling:
             synchronize_device(self.device)
@@ -1530,36 +1688,52 @@ class ConcurrentVoiceConversionService:
         if params.anonymization_only:
             prefix_len = 0
             prompt_target = torch.zeros([1, 0], dtype=torch.long, device=self.device)
+            target_prefix = source.source_narrow_reduced[:0]
         else:
-            prefix_len = int(timbre.target_narrow_reduced.numel())
+            target_prefix = timbre.target_narrow_reduced
             prompt_target = timbre.target_content_indices
 
-        max_chunk_size = max(1, self.vc_wrapper.ar_max_content_len - prefix_len)
+        target_prefix, prompt_target = self._fit_ar_target_context(
+            request_id,
+            source.source_narrow_reduced,
+            target_prefix,
+            prompt_target,
+            params.anonymization_only,
+        )
+        prefix_len = 0 if params.anonymization_only else int(target_prefix.numel())
+        cfm_chunk_budget = self._style_cfm_source_token_budget(source, timbre, params)
+        max_chunk_size = max(1, min(self.vc_wrapper.ar_max_content_len - prefix_len, cfm_chunk_budget))
+
         chunks = []
-        for start in range(0, int(source.source_narrow_reduced.numel()), max_chunk_size):
-            chunk = source.source_narrow_reduced[start:start + max_chunk_size]
-            if params.anonymization_only:
-                ar_tokens = chunk
-            else:
-                ar_tokens = torch.cat([timbre.target_narrow_reduced, chunk], dim=0)
-            with torch.no_grad():
-                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                    prompt_text = self.vc_wrapper.ar_length_regulator(ar_tokens[None])[0]
-            chunks.append((prompt_text, prompt_target))
-        if self.enable_profiling:
-            logger.info(
-                (
-                    "request=%s stage=ar_chunks_prepared chunks=%s source_narrow_len=%s target_prefix_len=%s "
-                    "max_chunk_size=%s prompt_target_len=%s anonymization_only=%s"
-                ),
-                request_id,
-                len(chunks),
-                int(source.source_narrow_reduced.numel()),
-                prefix_len,
-                max_chunk_size,
-                int(prompt_target.size(-1)),
+        start = 0
+        source_token_count = int(source.source_narrow_reduced.numel())
+        while start < source_token_count:
+            candidate_size = min(max_chunk_size, source_token_count - start)
+            chunk_size, prompt_text = self._fit_ar_chunk(
+                target_prefix,
+                prompt_target,
+                source.source_narrow_reduced,
+                start,
+                candidate_size,
                 params.anonymization_only,
             )
+            chunks.append((prompt_text, prompt_target))
+            start += chunk_size
+        logger.info(
+            (
+                "request=%s stage=ar_chunks_prepared chunks=%s source_narrow_len=%s target_prefix_len=%s "
+                "max_chunk_size=%s cfm_chunk_budget=%s prompt_target_len=%s max_seq_len=%s anonymization_only=%s"
+            ),
+            request_id,
+            len(chunks),
+            source_token_count,
+            prefix_len,
+            max_chunk_size,
+            cfm_chunk_budget,
+            int(prompt_target.size(-1)),
+            int(self.ar_scheduler.max_seq_len),
+            params.anonymization_only,
+        )
         return chunks
 
     def metrics(self) -> Dict[str, Dict[str, float]]:
