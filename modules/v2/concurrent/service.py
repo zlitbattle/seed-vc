@@ -1280,6 +1280,8 @@ class ConcurrentVoiceConversionService:
         )
         self.timbre_cache = TimbreFeatureCache(max_size=timbre_cache_size)
         self._feature_lock = asyncio.Lock()
+        self._inflight_lock = asyncio.Lock()
+        self._inflight_conversions: Dict[str, asyncio.Task] = {}
 
     async def start(self) -> None:
         await self.ar_scheduler.start()
@@ -1307,6 +1309,41 @@ class ConcurrentVoiceConversionService:
         return self.ar_scheduler.warmup_compiled_decode()
 
     async def convert(
+        self,
+        source_audio_path: str,
+        target_audio_path: str,
+        params: ConcurrentInferenceParams,
+    ) -> Tuple[str, int, np.ndarray]:
+        dedupe_key = self._conversion_dedupe_key(source_audio_path, target_audio_path, params)
+        owns_task = False
+        async with self._inflight_lock:
+            task = self._inflight_conversions.get(dedupe_key)
+            if task is None:
+                task = asyncio.create_task(self._convert_impl(source_audio_path, target_audio_path, params))
+                self._inflight_conversions[dedupe_key] = task
+                owns_task = True
+                logger.info("stage=convert_inflight_start key=%s", dedupe_key)
+            else:
+                logger.info("stage=convert_inflight_join key=%s", dedupe_key)
+
+        try:
+            request_id, sample_rate, waveform = await task
+            if owns_task:
+                return request_id, sample_rate, waveform
+            deduped_request_id = str(uuid.uuid4())
+            logger.info(
+                "request=%s stage=convert_inflight_done shared_request=%s",
+                deduped_request_id,
+                request_id,
+            )
+            return deduped_request_id, sample_rate, waveform.copy()
+        finally:
+            if owns_task:
+                async with self._inflight_lock:
+                    if self._inflight_conversions.get(dedupe_key) is task:
+                        self._inflight_conversions.pop(dedupe_key, None)
+
+    async def _convert_impl(
         self,
         source_audio_path: str,
         target_audio_path: str,
@@ -1373,6 +1410,28 @@ class ConcurrentVoiceConversionService:
             len(waveform),
         )
         return request_id, sample_rate, waveform
+
+    def _conversion_dedupe_key(
+        self,
+        source_audio_path: str,
+        target_audio_path: str,
+        params: ConcurrentInferenceParams,
+    ) -> str:
+        source_key = self._target_audio_cache_key(source_audio_path)
+        target_key = self._target_audio_cache_key(target_audio_path)
+        params_key = (
+            params.diffusion_steps,
+            params.length_adjust,
+            params.intelligibility_cfg_rate,
+            params.similarity_cfg_rate,
+            params.top_p,
+            params.temperature,
+            params.repetition_penalty,
+            params.convert_style,
+            params.anonymization_only,
+        )
+        digest = hashlib.sha256(repr((source_key, target_key, params_key)).encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
 
     async def _prepare_features_async(
         self,
