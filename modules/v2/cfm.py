@@ -82,7 +82,7 @@ class CFM(torch.nn.Module):
                     torch.cat([torch.zeros_like(style), torch.zeros_like(style)], dim=0),
                     torch.cat([mu, torch.zeros_like(mu)], dim=0),
                 )
-                cond_txt, uncond = cfg_dphi_dt[0:1], cfg_dphi_dt[1:2]
+                cond_txt, uncond = cfg_dphi_dt.chunk(2, dim=0)
                 dphi_dt = ((1.0 + inference_cfg_rate[0]) * cond_txt - inference_cfg_rate[0] * uncond)
             elif all(i == 0 for i in inference_cfg_rate):
                 dphi_dt = self.estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu)
@@ -96,7 +96,7 @@ class CFM(torch.nn.Module):
                     torch.cat([style, torch.zeros_like(style)], dim=0),
                     torch.cat([mu, mu], dim=0),
                 )
-                cond_txt_spk, cond_txt = cfg_dphi_dt[0:1], cfg_dphi_dt[1:2]
+                cond_txt_spk, cond_txt = cfg_dphi_dt.chunk(2, dim=0)
                 dphi_dt = ((1.0 + inference_cfg_rate[1]) * cond_txt_spk - inference_cfg_rate[1] * cond_txt)
             elif inference_cfg_rate[1] == 0:
                 cfg_dphi_dt = self.estimator(
@@ -107,7 +107,7 @@ class CFM(torch.nn.Module):
                     torch.cat([style, torch.zeros_like(style)], dim=0),
                     torch.cat([mu, torch.zeros_like(mu)], dim=0),
                 )
-                cond_txt_spk, uncond = cfg_dphi_dt[0:1], cfg_dphi_dt[1:2]
+                cond_txt_spk, uncond = cfg_dphi_dt.chunk(2, dim=0)
                 dphi_dt = ((1.0 + inference_cfg_rate[0]) * cond_txt_spk - inference_cfg_rate[0] * uncond)
             else:
                 # Multi-condition Classifier-Free Guidance inference introduced in MegaTTS3
@@ -119,7 +119,7 @@ class CFM(torch.nn.Module):
                     torch.cat([style, torch.zeros_like(style), torch.zeros_like(style)], dim=0),
                     torch.cat([mu, mu, torch.zeros_like(mu)], dim=0),
                 )
-                cond_txt_spk, cond_txt, uncond = cfg_dphi_dt[0:1], cfg_dphi_dt[1:2], cfg_dphi_dt[2:3]
+                cond_txt_spk, cond_txt, uncond = cfg_dphi_dt.chunk(3, dim=0)
                 dphi_dt = (1.0 + inference_cfg_rate[0] + inference_cfg_rate[1]) * cond_txt_spk - \
                     inference_cfg_rate[0] * uncond - inference_cfg_rate[1] * cond_txt
             x = x + dt * dphi_dt
