@@ -626,7 +626,10 @@ class ARScheduler:
                 else:
                     request.eager_decode_steps += 1
 
-            next_token_values = next_tokens[:len(group)].detach().cpu().tolist()
+            next_tokens = next_tokens[:len(group)]
+            next_token_values = next_tokens.detach().cpu().tolist()
+            embed_requests: List[ARGenerateRequest] = []
+            embed_tokens: List[torch.Tensor] = []
             for request, token, token_value in zip(group, next_tokens, next_token_values):
                 token = token.reshape(()).clone()
                 reached_eos = int(token_value) == eos_token and request.generated_token_count >= self.min_tokens_before_eos
@@ -641,12 +644,19 @@ class ARScheduler:
                     raise RuntimeError("AR request is missing generated token buffer")
                 request.generated_token_buffer[request.generated_token_count] = token.long()
                 request.generated_token_count += 1
-                profile_started_at = self._profile_start()
-                with self._autocast_context():
-                    request.last_emb = self.ar_wrapper.embed_generated_token(token)
-                request.decode_embed_sec += self._profile_elapsed(profile_started_at)
                 request.next_input_pos_value += 1
                 request.next_kv_pos_value += 1
+                embed_requests.append(request)
+                embed_tokens.append(token)
+
+            if embed_requests:
+                profile_started_at = self._profile_start()
+                with self._autocast_context():
+                    embedded_tokens = self.ar_wrapper.embed_generated_tokens(torch.stack(embed_tokens, dim=0))
+                embed_sec = self._profile_elapsed(profile_started_at)
+                for embed_index, request in enumerate(embed_requests):
+                    request.last_emb = embedded_tokens[embed_index:embed_index + 1]
+                    request.decode_embed_sec += embed_sec / len(embed_requests)
 
     def _log_decode_route_if_changed(
         self,

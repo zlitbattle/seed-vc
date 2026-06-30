@@ -482,6 +482,13 @@ class NaiveWrapper(nn.Module):
         token = token.long()
         return self.model.embed_base(token.unsqueeze(0), torch.LongTensor([1]).to(token.device))[1]
 
+    def embed_generated_tokens(self, tokens: Tensor) -> Tensor:
+        if tokens.dim() == 0:
+            tokens = tokens[None]
+        tokens = tokens.long().reshape(-1, 1)
+        token_lens = torch.ones(tokens.size(0), device=tokens.device, dtype=torch.long)
+        return self.model.embed_base(tokens, token_lens)[1]
+
     def decode_one_token_ar_batch(
             self,
             x: torch.Tensor,
