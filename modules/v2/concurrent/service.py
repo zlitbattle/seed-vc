@@ -936,7 +936,7 @@ class CFMScheduler:
         if self._tasks:
             return
         self._running = True
-        executor_workers = 1 if self.vc_wrapper.dit_compiled else self.max_concurrent
+        executor_workers = self.max_concurrent
         self._executor = ThreadPoolExecutor(
             max_workers=executor_workers,
             thread_name_prefix="seed-vc-cfm",
@@ -1530,6 +1530,7 @@ class ConcurrentVoiceConversionService:
         cfm_max_concurrent: int = 1,
         cfm_batch_max_size: int = CFM_BATCH_MAX_SIZE,
         cfm_batch_wait_sec: float = CFM_BATCH_WAIT_SEC,
+        feature_max_concurrent: int = 1,
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
@@ -1538,6 +1539,7 @@ class ConcurrentVoiceConversionService:
         self.device = device
         self.dtype = dtype
         self.enable_profiling = enable_profiling
+        self.feature_max_concurrent = max(1, int(feature_max_concurrent))
         self.ar_scheduler = ARScheduler(
             vc_wrapper.ar,
             device=device,
@@ -1559,7 +1561,7 @@ class ConcurrentVoiceConversionService:
         )
         self.timbre_cache = TimbreFeatureCache(max_size=timbre_cache_size)
         self.source_cache = SourceFeatureCache(max_size=source_cache_size)
-        self._feature_lock = asyncio.Lock()
+        self._feature_semaphore = asyncio.Semaphore(self.feature_max_concurrent)
         self._source_inflight_lock = asyncio.Lock()
         self._inflight_source_features: Dict[str, asyncio.Task] = {}
 
@@ -1577,7 +1579,7 @@ class ConcurrentVoiceConversionService:
         params: ConcurrentInferenceParams,
     ) -> List[int]:
         request_id = "warmup-cfm-buckets"
-        async with self._feature_lock:
+        async with self._feature_semaphore:
             timbre = await asyncio.to_thread(
                 self._get_or_compute_timbre_features,
                 request_id,
@@ -1673,7 +1675,7 @@ class ConcurrentVoiceConversionService:
     ) -> Tuple[SourceFeatures, TimbreFeatures, float]:
         timbre_started_at = time.perf_counter()
         feature_lock_wait_started_at = time.perf_counter()
-        async with self._feature_lock:
+        async with self._feature_semaphore:
             feature_lock_wait_sec = time.perf_counter() - feature_lock_wait_started_at
             timbre = await asyncio.to_thread(
                 self._get_or_compute_timbre_features,
@@ -2176,4 +2178,7 @@ class ConcurrentVoiceConversionService:
             "cfm_scheduler": self.cfm_scheduler.metrics(),
             "timbre_cache": self.timbre_cache.metrics(),
             "source_cache": self.source_cache.metrics(),
+            "feature_extraction": {
+                "max_concurrent": self.feature_max_concurrent,
+            },
         }
