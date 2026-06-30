@@ -71,6 +71,7 @@ class ARGenerateRequest:
     params: ConcurrentInferenceParams
     future: Optional[asyncio.Future] = None
     slot_id: Optional[int] = None
+    slot_id_tensor: Optional[torch.Tensor] = None
     is_prefilled: bool = False
     next_input_pos: Optional[torch.Tensor] = None
     next_kv_pos: Optional[torch.Tensor] = None
@@ -440,6 +441,7 @@ class ARScheduler:
         if not self.free_slots:
             raise RuntimeError("AR slot exhausted")
         request.slot_id = self.free_slots.pop(0)
+        request.slot_id_tensor = torch.tensor([request.slot_id], device=self.device, dtype=torch.long)
         request.activated_at = time.perf_counter()
         self.active.append(request)
         logger.info(
@@ -478,7 +480,7 @@ class ARScheduler:
                 emb_seq,
                 input_pos,
                 kv_pos,
-                slot_ids=[request.slot_id],
+                slot_ids=request.slot_id_tensor if request.slot_id_tensor is not None else [request.slot_id],
                 suppress_tokens=[eos_token],
                 top_p=request.params.top_p,
                 temperature=request.params.temperature,
@@ -498,13 +500,15 @@ class ARScheduler:
             device=token.device,
             dtype=torch.bool,
         )
-        request.previous_token_mask[int(token.detach().cpu())] = True
+        request.previous_token_mask.scatter_(0, token.long().reshape(1), True)
         profile_started_at = self._profile_start()
         with self._autocast_context():
             request.last_emb = self.ar_wrapper.embed_generated_token(token)
         request.prefill_embed_sec += self._profile_elapsed(profile_started_at)
         request.next_input_pos_value = int(input_pos[-1].detach().cpu()) + 1
         request.next_kv_pos_value = int(kv_pos[-1].detach().cpu()) + 1
+        request.next_input_pos = (input_pos[-1:].reshape(1, 1) + 1).clone()
+        request.next_kv_pos = (kv_pos[-1:].reshape(1, 1) + 1).clone()
         request.is_prefilled = True
         if self.enable_profiling:
             logger.info(
@@ -549,20 +553,19 @@ class ARScheduler:
         for (top_p, temperature, repetition_penalty), group in groups.items():
             profile_started_at = self._profile_start()
             x = torch.cat([request.last_emb for request in group], dim=0)
-            input_pos = torch.tensor(
-                [[request.next_input_pos_value] for request in group],
-                device=self.device,
-                dtype=torch.long,
-            )
-            kv_pos = torch.tensor(
-                [[request.next_kv_pos_value] for request in group],
-                device=self.device,
-                dtype=torch.long,
-            )
             if any(request.slot_id is None for request in group):
                 raise RuntimeError("AR request is missing slot_id during decode")
+            if any(
+                request.next_input_pos is None
+                or request.next_kv_pos is None
+                or request.slot_id_tensor is None
+                for request in group
+            ):
+                raise RuntimeError("AR request is missing cached decode position tensors")
+            input_pos = torch.cat([request.next_input_pos for request in group], dim=0)
+            kv_pos = torch.cat([request.next_kv_pos for request in group], dim=0)
             slot_ids_list = [int(request.slot_id) for request in group]
-            slot_ids = torch.tensor(slot_ids_list, device=self.device, dtype=torch.long)
+            slot_ids = torch.cat([request.slot_id_tensor for request in group], dim=0)
             previous_tokens = [
                 request.generated_token_buffer[:request.generated_token_count]
                 for request in group
@@ -649,17 +652,9 @@ class ARScheduler:
                     )
                     next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
                         torch.cat([request.last_emb for request in group], dim=0),
-                        torch.tensor(
-                            [[request.next_input_pos_value] for request in group],
-                            device=self.device,
-                            dtype=torch.long,
-                        ),
-                        torch.tensor(
-                            [[request.next_kv_pos_value] for request in group],
-                            device=self.device,
-                            dtype=torch.long,
-                        ),
-                        slot_ids=torch.tensor(slot_ids_list, device=self.device, dtype=torch.long),
+                        torch.cat([request.next_input_pos for request in group], dim=0),
+                        torch.cat([request.next_kv_pos for request in group], dim=0),
+                        slot_ids=torch.cat([request.slot_id_tensor for request in group], dim=0),
                         previous_tokens=previous_tokens,
                         previous_token_masks=previous_token_masks,
                         suppress_tokens=suppress_tokens,
@@ -696,9 +691,13 @@ class ARScheduler:
                 request.generated_token_buffer[request.generated_token_count] = token.long()
                 request.generated_token_count += 1
                 if request.previous_token_mask is not None:
-                    request.previous_token_mask[int(token_value)] = True
+                    request.previous_token_mask.scatter_(0, token.long().reshape(1), True)
                 request.next_input_pos_value += 1
                 request.next_kv_pos_value += 1
+                if request.next_input_pos is not None:
+                    request.next_input_pos.add_(1)
+                if request.next_kv_pos is not None:
+                    request.next_kv_pos.add_(1)
                 embed_requests.append(request)
                 embed_tokens.append(token)
 
