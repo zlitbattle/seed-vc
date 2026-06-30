@@ -1302,23 +1302,19 @@ class ConcurrentVoiceConversionService:
     ) -> Tuple[str, int, np.ndarray]:
         request_id = str(uuid.uuid4())
         total_started_at = time.perf_counter()
-        feature_lock_wait_started_at = time.perf_counter()
-        async with self._feature_lock:
-            feature_lock_wait_sec = time.perf_counter() - feature_lock_wait_started_at
-            prepare_started_at = time.perf_counter()
-            source_features, timbre_features = await asyncio.to_thread(
-                self._prepare_features,
-                request_id,
-                source_audio_path,
-                target_audio_path,
-                params.convert_style,
-            )
-            logger.info(
-                "request=%s stage=prepare_done lock_wait_sec=%.3f prepare_sec=%.3f",
-                request_id,
-                feature_lock_wait_sec,
-                time.perf_counter() - prepare_started_at,
-            )
+        prepare_started_at = time.perf_counter()
+        source_features, timbre_features, feature_lock_wait_sec = await self._prepare_features_async(
+            request_id,
+            source_audio_path,
+            target_audio_path,
+            params.convert_style,
+        )
+        logger.info(
+            "request=%s stage=prepare_done lock_wait_sec=%.3f prepare_sec=%.3f",
+            request_id,
+            feature_lock_wait_sec,
+            time.perf_counter() - prepare_started_at,
+        )
 
         ar_outputs = None
         if params.convert_style:
@@ -1365,6 +1361,45 @@ class ConcurrentVoiceConversionService:
             len(waveform),
         )
         return request_id, sample_rate, waveform
+
+    async def _prepare_features_async(
+        self,
+        request_id: str,
+        source_audio_path: str,
+        target_audio_path: str,
+        require_source_narrow: bool,
+    ) -> Tuple[SourceFeatures, TimbreFeatures, float]:
+        timbre_started_at = time.perf_counter()
+        feature_lock_wait_started_at = time.perf_counter()
+        async with self._feature_lock:
+            feature_lock_wait_sec = time.perf_counter() - feature_lock_wait_started_at
+            timbre = await asyncio.to_thread(
+                self._get_or_compute_timbre_features,
+                request_id,
+                target_audio_path,
+            )
+        logger.info(
+            "request=%s stage=timbre_done elapsed_sec=%.3f cache_key=%s",
+            request_id,
+            time.perf_counter() - timbre_started_at,
+            timbre.cache_key,
+        )
+
+        source_started_at = time.perf_counter()
+        source = await asyncio.to_thread(
+            self._compute_source_features,
+            request_id,
+            source_audio_path,
+            require_source_narrow,
+        )
+        logger.info(
+            "request=%s stage=source_features_done elapsed_sec=%.3f source_mel_len=%s require_narrow=%s",
+            request_id,
+            time.perf_counter() - source_started_at,
+            source.source_mel_len,
+            require_source_narrow,
+        )
+        return source, timbre, feature_lock_wait_sec
 
     def _prepare_features(
         self,
