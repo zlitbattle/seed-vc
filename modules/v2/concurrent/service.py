@@ -227,8 +227,11 @@ class ARScheduler:
             if 1 <= int(batch_size) <= max_slots
         }))
         self.compiled_decode_fns: Dict[int, Callable] = {}
+        self.compiled_sample_fn: Optional[Callable] = None
         self.compile_failures = 0
         self.compile_fallbacks = 0
+        self.sample_compile_failures = 0
+        self.sample_compile_fallbacks = 0
         self.waiting_queue: "asyncio.Queue[ARGenerateRequest]" = asyncio.Queue()
         self.active: List[ARGenerateRequest] = []
         self.free_slots = list(range(max_slots))
@@ -243,10 +246,12 @@ class ARScheduler:
             )
         if self.compile_decode_enabled:
             self._build_compiled_decode_fns()
+            self._build_compiled_sample_fn()
             logger.info(
-                "stage=ar_compile_enabled batches=%s max_slots=%s",
+                "stage=ar_compile_enabled batches=%s max_slots=%s sample_compiled=%s",
                 ",".join(str(batch_size) for batch_size in self.compiled_decode_fns),
                 self.max_slots,
+                self.compiled_sample_fn is not None,
             )
         logger.info(
             (
@@ -339,6 +344,51 @@ class ARScheduler:
                 **compile_kwargs,
             )
 
+    def _build_compiled_sample_fn(self) -> None:
+        if not self.compile_decode_enabled:
+            self.compiled_sample_fn = None
+            return
+
+        eos_token = int(self.ar_wrapper.model.config.vocab_size - 1)
+
+        def sample_forward(logits, previous_token_mask, suppress_eos, top_p, temperature, repetition_penalty):
+            logits = logits.clone()
+            penalized_logits = torch.where(
+                logits < 0,
+                logits * repetition_penalty,
+                logits / repetition_penalty,
+            )
+            logits = torch.where(previous_token_mask, penalized_logits, logits)
+            eos_values = logits[:, eos_token]
+            logits[:, eos_token] = torch.where(
+                suppress_eos,
+                torch.full_like(eos_values, -float("inf")),
+                eos_values,
+            )
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cum_probs > top_p
+            sorted_indices_to_remove[:, 0] = False
+            indices_to_remove = torch.zeros_like(sorted_indices_to_remove).scatter(
+                dim=-1,
+                index=sorted_indices,
+                src=sorted_indices_to_remove,
+            )
+            logits = logits.masked_fill(indices_to_remove, -float("inf"))
+            probs = torch.softmax(logits / torch.clamp(temperature, min=1e-5), dim=-1)
+            q = torch.empty_like(probs).exponential_(1)
+            return torch.argmax(probs / q, dim=-1).to(dtype=torch.int)
+
+        compile_kwargs = {
+            "fullgraph": True,
+            "backend": "inductor",
+        }
+        if self.compile_decode_cudagraphs:
+            compile_kwargs["mode"] = "reduce-overhead"
+        else:
+            compile_kwargs["options"] = {"triton.cudagraphs": False}
+        self.compiled_sample_fn = torch.compile(sample_forward, **compile_kwargs)
+
     @torch.no_grad()
     def warmup_compiled_decode(self) -> List[int]:
         if not self.compile_decode_enabled:
@@ -375,6 +425,52 @@ class ARScheduler:
                 logger.warning(
                     "stage=warmup_ar_decode_failed batch_size=%s error_type=%s error=%s",
                     batch_size,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        if self.compiled_sample_fn is not None:
+            started_at = time.perf_counter()
+            vocab_size = int(self.ar_wrapper.model.config.vocab_size)
+            sample_batch_size = max(self.compiled_decode_fns) if self.compiled_decode_fns else 1
+            logits = torch.zeros(
+                (sample_batch_size, vocab_size),
+                device=self.device,
+                dtype=input_dtype,
+            )
+            previous_token_mask = torch.zeros(
+                (sample_batch_size, vocab_size),
+                device=self.device,
+                dtype=torch.bool,
+            )
+            suppress_eos = torch.ones((sample_batch_size,), device=self.device, dtype=torch.bool)
+            top_p = torch.tensor(0.7, device=self.device)
+            temperature = torch.tensor(0.7, device=self.device)
+            repetition_penalty = torch.tensor(1.5, device=self.device)
+            try:
+                logger.info("stage=warmup_ar_sample_start batch_size=%s", sample_batch_size)
+                with self._autocast_context():
+                    sampled = self.compiled_sample_fn(
+                        logits,
+                        previous_token_mask,
+                        suppress_eos,
+                        top_p,
+                        temperature,
+                        repetition_penalty,
+                    )
+                synchronize_device(self.device)
+                del sampled
+                logger.info(
+                    "stage=warmup_ar_sample_done batch_size=%s elapsed_sec=%.3f",
+                    sample_batch_size,
+                    time.perf_counter() - started_at,
+                )
+            except Exception as exc:
+                self.sample_compile_failures += 1
+                self.compiled_sample_fn = None
+                logger.warning(
+                    "stage=warmup_ar_sample_failed batch_size=%s error_type=%s error=%s",
+                    sample_batch_size,
                     type(exc).__name__,
                     exc,
                 )
@@ -669,48 +765,79 @@ class ARScheduler:
                         previous_token_masks=previous_token_masks,
                         suppress_tokens=suppress_tokens,
                         compiled_decode_fn=compiled_decode_fn,
+                        compiled_sample_fn=self.compiled_sample_fn,
                         active_count=active_count,
                         top_p=top_p,
                         temperature=temperature,
                         repetition_penalty=repetition_penalty,
                     )
                 except Exception as exc:
-                    if compiled_decode_fn is None or decode_bucket is None:
-                        raise
-                    self.compile_fallbacks += 1
-                    self.compiled_decode_fns.pop(decode_bucket, None)
-                    if not self.compiled_decode_fns:
-                        self.compile_decode_enabled = False
-                    logger.warning(
-                        (
-                            "stage=ar_decode_compile_fallback batch_size=%s active_count=%s "
-                            "requests=%s chunks=%s error_type=%s error=%s"
-                        ),
-                        decode_bucket,
-                        active_count,
-                        ",".join(request.request_id for request in group),
-                        ",".join(str(request.chunk_index) for request in group),
-                        type(exc).__name__,
-                        exc,
-                    )
-                    next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
-                        torch.cat([request.last_emb for request in group], dim=0),
-                        torch.cat([request.next_input_pos for request in group], dim=0),
-                        torch.cat([request.next_kv_pos for request in group], dim=0),
-                        slot_ids=torch.cat([request.slot_id_tensor for request in group], dim=0),
-                        previous_tokens=previous_tokens,
-                        previous_token_masks=previous_token_masks,
-                        suppress_tokens=suppress_tokens,
-                        top_p=top_p,
-                        temperature=temperature,
-                        repetition_penalty=repetition_penalty,
-                    )
-                    decode_mode = "eager_fallback"
+                    if self.compiled_sample_fn is not None:
+                        self.sample_compile_fallbacks += 1
+                        self.compiled_sample_fn = None
+                        logger.warning(
+                            (
+                                "stage=ar_sample_compile_fallback active_count=%s requests=%s "
+                                "chunks=%s error_type=%s error=%s"
+                            ),
+                            active_count,
+                            ",".join(request.request_id for request in group),
+                            ",".join(str(request.chunk_index) for request in group),
+                            type(exc).__name__,
+                            exc,
+                        )
+                        next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
+                            x,
+                            input_pos,
+                            kv_pos,
+                            slot_ids=slot_ids,
+                            previous_tokens=previous_tokens,
+                            previous_token_masks=previous_token_masks,
+                            suppress_tokens=suppress_tokens,
+                            compiled_decode_fn=compiled_decode_fn,
+                            active_count=active_count,
+                            top_p=top_p,
+                            temperature=temperature,
+                            repetition_penalty=repetition_penalty,
+                        )
+                        decode_mode = f"{decode_mode}_sample_fallback"
+                    else:
+                        if compiled_decode_fn is None or decode_bucket is None:
+                            raise
+                        self.compile_fallbacks += 1
+                        self.compiled_decode_fns.pop(decode_bucket, None)
+                        if not self.compiled_decode_fns:
+                            self.compile_decode_enabled = False
+                        logger.warning(
+                            (
+                                "stage=ar_decode_compile_fallback batch_size=%s active_count=%s "
+                                "requests=%s chunks=%s error_type=%s error=%s"
+                            ),
+                            decode_bucket,
+                            active_count,
+                            ",".join(request.request_id for request in group),
+                            ",".join(str(request.chunk_index) for request in group),
+                            type(exc).__name__,
+                            exc,
+                        )
+                        next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
+                            torch.cat([request.last_emb for request in group], dim=0),
+                            torch.cat([request.next_input_pos for request in group], dim=0),
+                            torch.cat([request.next_kv_pos for request in group], dim=0),
+                            slot_ids=torch.cat([request.slot_id_tensor for request in group], dim=0),
+                            previous_tokens=previous_tokens,
+                            previous_token_masks=previous_token_masks,
+                            suppress_tokens=suppress_tokens,
+                            top_p=top_p,
+                            temperature=temperature,
+                            repetition_penalty=repetition_penalty,
+                        )
+                        decode_mode = "eager_fallback"
             step_sec = self._profile_elapsed(profile_started_at)
             for request in group:
                 request.decode_step_sec += step_sec / len(group)
                 request.decode_steps += 1
-                if decode_mode == "compiled":
+                if decode_mode.startswith("compiled"):
                     request.compiled_decode_steps += 1
                 else:
                     request.eager_decode_steps += 1
@@ -940,8 +1067,11 @@ class ARScheduler:
             "failed": self.failed,
             "compile_decode_enabled": int(self.compile_decode_enabled),
             "compiled_decode_batches": list(sorted(self.compiled_decode_fns)),
+            "compile_sample_enabled": int(self.compiled_sample_fn is not None),
             "compile_failures": self.compile_failures,
             "compile_fallbacks": self.compile_fallbacks,
+            "sample_compile_failures": self.sample_compile_failures,
+            "sample_compile_fallbacks": self.sample_compile_fallbacks,
         }
 
 

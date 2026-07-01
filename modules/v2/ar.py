@@ -499,6 +499,7 @@ class NaiveWrapper(nn.Module):
             previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
             suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
             compiled_decode_fn = None,
+            compiled_sample_fn = None,
             active_count: Optional[int] = None,
             **sampling_kwargs,
     ) -> torch.Tensor:
@@ -513,6 +514,29 @@ class NaiveWrapper(nn.Module):
             if batch_suppress_tokens is None and "suppress_tokens" in batch_sampling_kwargs:
                 shared_suppress_tokens = batch_sampling_kwargs.pop("suppress_tokens")
                 batch_suppress_tokens = [shared_suppress_tokens for _ in range(sample_count)]
+            if compiled_sample_fn is not None and previous_token_masks is not None:
+                token_mask = torch.stack(previous_token_masks, dim=0).to(
+                    device=result.logits.device,
+                    dtype=torch.bool,
+                )
+                eos_token = self.model.config.vocab_size - 1
+                suppress_eos = torch.tensor(
+                    [
+                        row_suppress_tokens is not None and eos_token in row_suppress_tokens
+                        for row_suppress_tokens in (batch_suppress_tokens or [])
+                    ],
+                    device=result.logits.device,
+                    dtype=torch.bool,
+                )
+                sampled = compiled_sample_fn(
+                    result.logits[:sample_count, -1],
+                    token_mask,
+                    suppress_eos,
+                    torch.as_tensor(batch_sampling_kwargs.get("top_p", 0.7), device=result.logits.device),
+                    torch.as_tensor(batch_sampling_kwargs.get("temperature", 0.7), device=result.logits.device),
+                    torch.as_tensor(batch_sampling_kwargs.get("repetition_penalty", 1.5), device=result.logits.device),
+                )
+                return sampled.reshape(-1)
             sampled, _ = sample_batch(
                 result.logits[:sample_count],
                 previous_tokens=previous_tokens,
