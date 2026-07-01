@@ -516,20 +516,32 @@ class NaiveWrapper(nn.Module):
             if batch_suppress_tokens is None and "suppress_tokens" in batch_sampling_kwargs:
                 shared_suppress_tokens = batch_sampling_kwargs.pop("suppress_tokens")
                 batch_suppress_tokens = [shared_suppress_tokens for _ in range(sample_count)]
-            if compiled_sample_fn is not None and previous_token_masks is not None:
-                token_mask = torch.stack(previous_token_masks, dim=0).to(
-                    device=result.logits.device,
-                    dtype=torch.bool,
-                )
-                eos_token = self.model.config.vocab_size - 1
-                suppress_eos = torch.tensor(
-                    [
-                        row_suppress_tokens is not None and eos_token in row_suppress_tokens
-                        for row_suppress_tokens in (batch_suppress_tokens or [])
-                    ],
-                    device=result.logits.device,
-                    dtype=torch.bool,
-                )
+            if (
+                compiled_sample_fn is not None
+                and (previous_token_mask_batch is not None or previous_token_masks is not None)
+            ):
+                if previous_token_mask_batch is not None:
+                    token_mask = previous_token_mask_batch.to(
+                        device=result.logits.device,
+                        dtype=torch.bool,
+                    )
+                else:
+                    token_mask = torch.stack(previous_token_masks, dim=0).to(
+                        device=result.logits.device,
+                        dtype=torch.bool,
+                    )
+                if suppress_eos is None:
+                    eos_token = self.model.config.vocab_size - 1
+                    suppress_eos = torch.tensor(
+                        [
+                            row_suppress_tokens is not None and eos_token in row_suppress_tokens
+                            for row_suppress_tokens in (batch_suppress_tokens or [])
+                        ],
+                        device=result.logits.device,
+                        dtype=torch.bool,
+                    )
+                else:
+                    suppress_eos = suppress_eos.to(device=result.logits.device, dtype=torch.bool)
                 sampled = compiled_sample_fn(
                     result.logits[:sample_count, -1],
                     token_mask,
