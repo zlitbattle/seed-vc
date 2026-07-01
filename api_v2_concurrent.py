@@ -606,6 +606,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-cache-size", type=int, default=64)
     parser.add_argument("--cfm-batch-max-size", type=int, default=4)
     parser.add_argument("--cfm-batch-wait-sec", type=float, default=0.18)
+    parser.add_argument(
+        "--cfm-inline",
+        action="store_true",
+        help="Experimental: run CFM on the scheduler event-loop thread instead of ThreadPoolExecutor",
+    )
     parser.add_argument("--feature-max-concurrent", type=int, default=1)
     parser.add_argument(
         "--ar-batch-wait-sec",
@@ -651,6 +656,7 @@ async def initialize_service(args) -> None:
         cfm_max_concurrent=args.cfm_max_concurrent,
         cfm_batch_max_size=args.cfm_batch_max_size,
         cfm_batch_wait_sec=args.cfm_batch_wait_sec,
+        cfm_inline=args.cfm_inline,
         feature_max_concurrent=args.feature_max_concurrent,
         ar_batch_wait_sec=args.ar_batch_wait_sec,
         enable_profiling=args.enable_profiling,

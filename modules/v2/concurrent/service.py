@@ -1088,6 +1088,7 @@ class CFMScheduler:
         enable_profiling: bool = False,
         batch_max_size: int = CFM_BATCH_MAX_SIZE,
         batch_wait_sec: float = CFM_BATCH_WAIT_SEC,
+        run_inline: bool = False,
     ):
         self.vc_wrapper = vc_wrapper
         self.device = device
@@ -1096,6 +1097,7 @@ class CFMScheduler:
         self.enable_profiling = enable_profiling
         self.batch_max_size = max(1, int(batch_max_size))
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
+        self.run_inline = bool(run_inline)
         self.queue: "asyncio.Queue[CFMJob]" = asyncio.Queue()
         self._deferred_jobs: Deque[CFMJob] = deque()
         self._tasks: List[asyncio.Task] = []
@@ -1111,14 +1113,16 @@ class CFMScheduler:
         if self._tasks:
             return
         self._running = True
-        executor_workers = self.max_concurrent
-        self._executor = ThreadPoolExecutor(
-            max_workers=executor_workers,
-            thread_name_prefix="seed-vc-cfm",
-        )
+        executor_workers = 0 if self.run_inline else self.max_concurrent
+        if not self.run_inline:
+            self._executor = ThreadPoolExecutor(
+                max_workers=executor_workers,
+                thread_name_prefix="seed-vc-cfm",
+            )
         logger.info(
-            "stage=cfm_executor_started workers=%s dit_compiled=%s batch_max_size=%s batch_wait_sec=%.3f",
+            "stage=cfm_executor_started workers=%s run_inline=%s dit_compiled=%s batch_max_size=%s batch_wait_sec=%.3f",
             executor_workers,
+            self.run_inline,
             self.vc_wrapper.dit_compiled,
             self.batch_max_size,
             self.batch_wait_sec,
@@ -1230,6 +1234,8 @@ class CFMScheduler:
         return jobs
 
     async def _run_in_executor(self, func, *args):
+        if self.run_inline:
+            return func(*args)
         if self._executor is None:
             raise RuntimeError("CFM scheduler is not started")
         loop = asyncio.get_running_loop()
@@ -1683,6 +1689,7 @@ class CFMScheduler:
             "max_concurrent": self.max_concurrent,
             "batch_max_size": self.batch_max_size,
             "batch_wait_sec": self.batch_wait_sec,
+            "run_inline": int(self.run_inline),
             "active_cfm": self.active,
             "queue_length": self.queue.qsize(),
             "deferred_length": len(self._deferred_jobs),
@@ -1706,6 +1713,7 @@ class ConcurrentVoiceConversionService:
         cfm_max_concurrent: int = 1,
         cfm_batch_max_size: int = CFM_BATCH_MAX_SIZE,
         cfm_batch_wait_sec: float = CFM_BATCH_WAIT_SEC,
+        cfm_inline: bool = False,
         feature_max_concurrent: int = 1,
         ar_batch_wait_sec: float = 0.0,
         enable_profiling: bool = False,
@@ -1740,6 +1748,7 @@ class ConcurrentVoiceConversionService:
             enable_profiling=enable_profiling,
             batch_max_size=cfm_batch_max_size,
             batch_wait_sec=cfm_batch_wait_sec,
+            run_inline=cfm_inline,
         )
         self.timbre_cache = TimbreFeatureCache(max_size=timbre_cache_size)
         self.source_cache = SourceFeatureCache(max_size=source_cache_size)
