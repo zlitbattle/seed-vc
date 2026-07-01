@@ -2,6 +2,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 from functools import lru_cache
+import io
 import logging
 import os
 import platform
@@ -20,7 +21,7 @@ import torch
 import uvicorn
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
 
 from modules.v2.concurrent import ConcurrentInferenceParams, ConcurrentVoiceConversionService
@@ -197,8 +198,29 @@ async def convert(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         filename = f"{request_id}{output_suffix}"
-        output_path = temp_dir_path / filename
         encode_started_at = time.perf_counter()
+        if output_suffix in SOUNDFILE_OUTPUT_FORMATS:
+            output_bytes = await asyncio.to_thread(
+                encode_audio_bytes,
+                waveform,
+                sample_rate,
+                output_suffix,
+            )
+            logger.info(
+                "request=%s stage=output_encoded encode_sec=%.3f output_bytes=%s total_api_sec=%.3f",
+                request_id,
+                time.perf_counter() - encode_started_at,
+                len(output_bytes),
+                time.perf_counter() - request_started_at,
+            )
+            return Response(
+                content=output_bytes,
+                media_type=OUTPUT_MEDIA_TYPES[output_suffix],
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                background=BackgroundTask(shutil.rmtree, temp_dir_path, ignore_errors=True),
+            )
+
+        output_path = temp_dir_path / filename
         await asyncio.to_thread(write_audio_file, output_path, waveform, sample_rate, output_suffix)
         logger.info(
             "request=%s stage=output_encoded encode_sec=%.3f output_bytes=%s total_api_sec=%.3f",
@@ -264,6 +286,12 @@ def write_audio_file(output_path: Path, waveform: np.ndarray, sample_rate: int, 
         sf.write(str(output_path), waveform, sample_rate, format=SOUNDFILE_OUTPUT_FORMATS[suffix])
         return
     write_audio_file_with_ffmpeg(output_path, waveform, sample_rate, suffix)
+
+
+def encode_audio_bytes(waveform: np.ndarray, sample_rate: int, suffix: str) -> bytes:
+    audio_buffer = io.BytesIO()
+    sf.write(audio_buffer, waveform, sample_rate, format=SOUNDFILE_OUTPUT_FORMATS[suffix])
+    return audio_buffer.getvalue()
 
 
 def write_audio_file_with_ffmpeg(output_path: Path, waveform: np.ndarray, sample_rate: int, suffix: str) -> None:
