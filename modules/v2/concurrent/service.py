@@ -542,9 +542,12 @@ class ARScheduler:
                     await asyncio.sleep(0.001)
                     continue
 
-                for request in list(self.active):
-                    if not request.is_prefilled:
-                        self._prefill_one(request)
+                prefill_requests = [
+                    request for request in list(self.active)
+                    if not request.is_prefilled
+                ]
+                if prefill_requests:
+                    self._prefill_requests(prefill_requests)
 
                 decode_requests = [request for request in self.active if request.is_prefilled]
                 if decode_requests:
@@ -640,21 +643,61 @@ class ARScheduler:
         self._finish(request, reason="eos")
         return True
 
-    @torch.no_grad()
-    def _prefill_one(self, request: ARGenerateRequest) -> None:
-        assert request.slot_id is not None
-        profile_started_at = self._profile_start()
-        with self._autocast_context():
-            emb_seq, input_pos, kv_pos = self.ar_wrapper.build_generation_inputs(
-                request.prompt_text,
-                request.prompt_target,
-            )
-        request.prefill_build_sec += self._profile_elapsed(profile_started_at)
-        if emb_seq.size(1) >= self.max_seq_len:
-            raise RuntimeError(
-                f"AR prompt is too long: {emb_seq.size(1)} >= max_seq_len {self.max_seq_len}"
-            )
+    def _prefill_group_key(
+        self,
+        request: ARGenerateRequest,
+        emb_seq: torch.Tensor,
+        input_pos: torch.Tensor,
+        kv_pos: torch.Tensor,
+    ) -> Tuple[int, int, int, float, float, float]:
+        return (
+            int(emb_seq.size(1)),
+            int(input_pos.numel()),
+            int(kv_pos.numel()),
+            request.params.top_p,
+            request.params.temperature,
+            request.params.repetition_penalty,
+        )
 
+    @torch.no_grad()
+    def _prefill_requests(self, requests: Sequence[ARGenerateRequest]) -> None:
+        built_groups: Dict[
+            Tuple[int, int, int, float, float, float],
+            List[Tuple[ARGenerateRequest, torch.Tensor, torch.Tensor, torch.Tensor]],
+        ] = {}
+
+        for request in requests:
+            assert request.slot_id is not None
+            profile_started_at = self._profile_start()
+            with self._autocast_context():
+                emb_seq, input_pos, kv_pos = self.ar_wrapper.build_generation_inputs(
+                    request.prompt_text,
+                    request.prompt_target,
+                )
+            request.prefill_build_sec += self._profile_elapsed(profile_started_at)
+            if emb_seq.size(1) >= self.max_seq_len:
+                raise RuntimeError(
+                    f"AR prompt is too long: {emb_seq.size(1)} >= max_seq_len {self.max_seq_len}"
+                )
+            key = self._prefill_group_key(request, emb_seq, input_pos, kv_pos)
+            built_groups.setdefault(key, []).append((request, emb_seq, input_pos, kv_pos))
+
+        for group in built_groups.values():
+            if len(group) == 1:
+                request, emb_seq, input_pos, kv_pos = group[0]
+                self._prefill_built_one(request, emb_seq, input_pos, kv_pos)
+            else:
+                self._prefill_built_batch(group)
+
+    @torch.no_grad()
+    def _prefill_built_one(
+        self,
+        request: ARGenerateRequest,
+        emb_seq: torch.Tensor,
+        input_pos: torch.Tensor,
+        kv_pos: torch.Tensor,
+    ) -> None:
+        assert request.slot_id is not None
         eos_token = self.ar_wrapper.model.config.vocab_size - 1
         profile_started_at = self._profile_start()
         with self._autocast_context():
@@ -669,7 +712,50 @@ class ARScheduler:
                 repetition_penalty=request.params.repetition_penalty,
             )
         request.prefill_decode_sec += self._profile_elapsed(profile_started_at)
-        token = next_tokens[0].reshape(()).clone()
+        self._finish_prefill(request, next_tokens[0], input_pos, kv_pos)
+
+    @torch.no_grad()
+    def _prefill_built_batch(
+        self,
+        group: Sequence[Tuple[ARGenerateRequest, torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> None:
+        first_request, _, first_input_pos, first_kv_pos = group[0]
+        eos_token = self.ar_wrapper.model.config.vocab_size - 1
+        slot_ids = torch.cat([
+            request.slot_id_tensor
+            for request, _, _, _ in group
+            if request.slot_id_tensor is not None
+        ], dim=0)
+        if slot_ids.numel() != len(group):
+            raise RuntimeError("AR request is missing slot_id during batched prefill")
+
+        profile_started_at = self._profile_start()
+        with self._autocast_context():
+            next_tokens = self.ar_wrapper.decode_one_token_ar_batch(
+                torch.cat([emb_seq for _, emb_seq, _, _ in group], dim=0),
+                first_input_pos,
+                first_kv_pos,
+                slot_ids=slot_ids,
+                suppress_tokens=[[eos_token] for _ in group],
+                active_count=len(group),
+                top_p=first_request.params.top_p,
+                temperature=first_request.params.temperature,
+                repetition_penalty=first_request.params.repetition_penalty,
+            )
+        elapsed = self._profile_elapsed(profile_started_at)
+        for request, _, _, _ in group:
+            request.prefill_decode_sec += elapsed / len(group)
+        for (request, _, input_pos, kv_pos), token in zip(group, next_tokens):
+            self._finish_prefill(request, token, input_pos, kv_pos)
+
+    def _finish_prefill(
+        self,
+        request: ARGenerateRequest,
+        token: torch.Tensor,
+        input_pos: torch.Tensor,
+        kv_pos: torch.Tensor,
+    ) -> None:
+        token = token.reshape(()).clone()
         request.generated_token_buffer = torch.empty(
             (self.max_new_tokens,),
             device=token.device,
@@ -688,10 +774,18 @@ class ARScheduler:
         with self._autocast_context():
             request.last_emb = self.ar_wrapper.embed_generated_token(token)
         request.prefill_embed_sec += self._profile_elapsed(profile_started_at)
-        request.next_input_pos_value = int(input_pos[-1].detach().cpu()) + 1
-        request.next_kv_pos_value = int(kv_pos[-1].detach().cpu()) + 1
-        request.next_input_pos = (input_pos[-1:].reshape(1, 1) + 1).clone()
-        request.next_kv_pos = (kv_pos[-1:].reshape(1, 1) + 1).clone()
+        request.next_input_pos_value = int(request.prompt_target.size(-1)) + 1
+        request.next_kv_pos_value = int(kv_pos.numel())
+        request.next_input_pos = torch.tensor(
+            [[request.next_input_pos_value]],
+            device=token.device,
+            dtype=torch.long,
+        )
+        request.next_kv_pos = torch.tensor(
+            [[request.next_kv_pos_value]],
+            device=token.device,
+            dtype=torch.long,
+        )
         request.is_prefilled = True
         if self.enable_profiling:
             logger.info(
@@ -704,7 +798,7 @@ class ARScheduler:
                 request.slot_id,
                 request.prompt_text.size(1),
                 request.prompt_target.size(-1),
-                emb_seq.size(1),
+                kv_pos.numel(),
                 request.prefill_build_sec,
                 request.prefill_decode_sec,
                 request.prefill_embed_sec,
