@@ -1528,11 +1528,8 @@ class CFMScheduler:
         other_original_len = self._style_job_condition_len(other)
         if self.vc_wrapper.dit_compiled:
             try:
-                first_bucket = self.vc_wrapper.select_cfm_compile_bucket(first_original_len)
-                other_bucket = self.vc_wrapper.select_cfm_compile_bucket(other_original_len)
+                self.vc_wrapper.select_cfm_compile_bucket(max(first_original_len, other_original_len))
             except RuntimeError:
-                return False
-            if first_bucket != other_bucket:
                 return False
 
         return (
