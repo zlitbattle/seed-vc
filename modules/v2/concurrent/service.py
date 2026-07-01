@@ -876,14 +876,15 @@ class ARScheduler:
             if len(group) > 1:
                 previous_tokens = None
                 previous_token_masks = None
-                previous_token_mask_batch = self.previous_token_masks_by_slot.index_select(0, active_slot_ids)
-                suppress_eos = torch.tensor(
-                    [
-                        request.generated_token_count < self.min_tokens_before_eos
-                        for request in group
-                    ],
-                    device=self.device,
-                    dtype=torch.bool,
+                previous_token_mask_batch = self._select_previous_token_masks(active_slot_ids, slot_ids_list)
+                eos_suppression = [
+                    request.generated_token_count < self.min_tokens_before_eos
+                    for request in group
+                ]
+                suppress_eos = (
+                    torch.tensor(eos_suppression, device=self.device, dtype=torch.bool)
+                    if any(eos_suppression)
+                    else None
                 )
                 suppress_tokens = None
             else:
@@ -1163,6 +1164,22 @@ class ARScheduler:
             if active_count <= compiled_batch_size:
                 return self.compiled_decode_fns[batch_size], compiled_batch_size, kv_bucket
         return None, None, None
+
+    def _select_previous_token_masks(
+        self,
+        slot_ids: torch.Tensor,
+        slot_ids_list: Sequence[int],
+    ) -> torch.Tensor:
+        if slot_ids.numel() <= 0:
+            return self.previous_token_masks_by_slot[:0]
+        if all(
+            current_slot + 1 == next_slot
+            for current_slot, next_slot in zip(slot_ids_list, slot_ids_list[1:])
+        ):
+            start = slot_ids_list[0]
+            end = start + int(slot_ids.numel())
+            return self.previous_token_masks_by_slot[start:end]
+        return self.previous_token_masks_by_slot.index_select(0, slot_ids)
 
     def _pad_decode_batch(
         self,
