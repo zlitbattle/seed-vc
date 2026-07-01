@@ -115,14 +115,19 @@ class VoiceConversionWrapper(torch.nn.Module):
             mode="reduce-overhead" if torch.cuda.is_available() else None,
         )
 
-    def compile_cfm(self, use_cudagraphs: bool = False):
+    def compile_cfm(self, use_cudagraphs: bool = False, mode: str = None):
         self.prepare_cfm_for_compile()
+        selected_mode = mode
+        if selected_mode == "default":
+            selected_mode = None
+        if selected_mode is None and torch.cuda.is_available() and use_cudagraphs:
+            selected_mode = "reduce-overhead"
         compile_kwargs = {
             "fullgraph": True,
             "backend": "inductor" if torch.cuda.is_available() else "aot_eager",
-            "mode": "reduce-overhead" if torch.cuda.is_available() else None,
+            "mode": selected_mode if torch.cuda.is_available() else None,
         }
-        if torch.cuda.is_available() and not use_cudagraphs:
+        if torch.cuda.is_available() and not use_cudagraphs and selected_mode is None:
             # CFM runs inside a ThreadPoolExecutor in the concurrent API. Inductor
             # CUDA Graph Trees can hit thread-local state assertions there, so keep
             # the inductor graph but disable cudagraph capture for this compiled path.

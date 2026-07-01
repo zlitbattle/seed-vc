@@ -533,7 +533,10 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
     if args.compile_ar or args.compile_ar_cudagraphs or args.compile_cfm or args.compile_cfm_cudagraphs:
         configure_torch_compile()
     if args.compile_cfm or args.compile_cfm_cudagraphs:
-        vc_wrapper.compile_cfm(use_cudagraphs=args.compile_cfm_cudagraphs)
+        vc_wrapper.compile_cfm(
+            use_cudagraphs=args.compile_cfm_cudagraphs,
+            mode=args.compile_cfm_mode,
+        )
     return vc_wrapper
 
 
@@ -646,6 +649,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--compile-cfm-cudagraphs",
         action="store_true",
         help="Experimental: use torch.compile reduce-overhead/CUDA Graphs for CFM",
+    )
+    parser.add_argument(
+        "--compile-cfm-mode",
+        choices=("default", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune"),
+        default=None,
+        help="Optional torch.compile mode for CFM transformer; omitted preserves the legacy no-cudagraph path",
     )
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")
