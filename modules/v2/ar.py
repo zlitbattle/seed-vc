@@ -497,7 +497,9 @@ class NaiveWrapper(nn.Module):
             slot_ids: Union[Tensor, Sequence[int]],
             previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
             previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
+            previous_token_mask_batch: Optional[torch.Tensor] = None,
             suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+            suppress_eos: Optional[torch.Tensor] = None,
             compiled_decode_fn = None,
             compiled_sample_fn = None,
             active_count: Optional[int] = None,
@@ -541,7 +543,10 @@ class NaiveWrapper(nn.Module):
                 result.logits[:sample_count],
                 previous_tokens=previous_tokens,
                 previous_token_masks=previous_token_masks,
+                previous_token_mask_batch=previous_token_mask_batch,
                 suppress_tokens=batch_suppress_tokens,
+                suppress_eos=suppress_eos,
+                eos_token=self.model.config.vocab_size - 1,
                 **batch_sampling_kwargs,
             )
             return sampled.reshape(-1)
@@ -881,14 +886,20 @@ def sample_batch(
     logits,
     previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
     previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    previous_token_mask_batch: Optional[torch.Tensor] = None,
     suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+    suppress_eos: Optional[torch.Tensor] = None,
+    eos_token: Optional[int] = None,
     **sampling_kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     probs = logits_to_probs_batch(
         logits=logits[:, -1],
         previous_tokens=previous_tokens,
         previous_token_masks=previous_token_masks,
+        previous_token_mask_batch=previous_token_mask_batch,
         suppress_tokens=suppress_tokens,
+        suppress_eos=suppress_eos,
+        eos_token=eos_token,
         **sampling_kwargs,
     )
     idx_next = multinomial_sample_one_no_sync(probs)
@@ -941,7 +952,10 @@ def logits_to_probs_batch(
     logits,
     previous_tokens: Optional[Sequence[Optional[torch.Tensor]]] = None,
     previous_token_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    previous_token_mask_batch: Optional[torch.Tensor] = None,
     suppress_tokens: Optional[Sequence[Optional[List[int]]]] = None,
+    suppress_eos: Optional[torch.Tensor] = None,
+    eos_token: Optional[int] = None,
     temperature: torch.Tensor = 0.7,
     top_p: torch.Tensor = 0.7,
     repetition_penalty: torch.Tensor = 1.5,
@@ -949,7 +963,15 @@ def logits_to_probs_batch(
     # Clone because repetition penalty and top-p filtering are applied in-place.
     logits = logits.clone()
 
-    if previous_token_masks is not None and all(mask is not None for mask in previous_token_masks):
+    if previous_token_mask_batch is not None:
+        token_mask = previous_token_mask_batch.to(device=logits.device, dtype=torch.bool)
+        penalized_logits = torch.where(
+            logits < 0,
+            logits * repetition_penalty,
+            logits / repetition_penalty,
+        )
+        logits = torch.where(token_mask, penalized_logits, logits)
+    elif previous_token_masks is not None and all(mask is not None for mask in previous_token_masks):
         token_mask = torch.stack(previous_token_masks, dim=0).to(device=logits.device, dtype=torch.bool)
         penalized_logits = torch.where(
             logits < 0,
@@ -969,7 +991,16 @@ def logits_to_probs_batch(
             )
             row_logits.scatter_(dim=0, index=tokens, src=score)
 
-    if suppress_tokens is not None:
+    if suppress_eos is not None:
+        if eos_token is None:
+            raise ValueError("eos_token is required when suppress_eos is provided")
+        eos_values = logits[:, eos_token]
+        logits[:, eos_token] = torch.where(
+            suppress_eos.to(device=logits.device, dtype=torch.bool),
+            torch.full_like(eos_values, -float("Inf")),
+            eos_values,
+        )
+    elif suppress_tokens is not None:
         for batch_idx, row_suppress_tokens in enumerate(suppress_tokens):
             if row_suppress_tokens is not None:
                 logits[batch_idx, row_suppress_tokens] = -float("Inf")

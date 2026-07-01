@@ -245,6 +245,11 @@ class ARScheduler:
         self.waiting_queue: "asyncio.Queue[ARGenerateRequest]" = asyncio.Queue()
         self.active: List[ARGenerateRequest] = []
         self.free_slots = list(range(max_slots))
+        self.previous_token_masks_by_slot = torch.zeros(
+            (max_slots, int(self.ar_wrapper.model.config.vocab_size)),
+            device=device,
+            dtype=torch.bool,
+        )
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self.completed = 0
@@ -764,11 +769,10 @@ class ARScheduler:
         request.generated_token_buffer[0] = token.long()
         request.generated_token_count = 1
         request.last_eos_check_token_count = 1
-        request.previous_token_mask = torch.zeros(
-            (int(self.ar_wrapper.model.config.vocab_size),),
-            device=token.device,
-            dtype=torch.bool,
-        )
+        if request.slot_id is None:
+            raise RuntimeError("AR request is missing slot_id during prefill finalization")
+        request.previous_token_mask = self.previous_token_masks_by_slot[request.slot_id]
+        request.previous_token_mask.zero_()
         request.previous_token_mask.scatter_(0, token.long().reshape(1), True)
         profile_started_at = self._profile_start()
         with self._autocast_context():
@@ -843,15 +847,32 @@ class ARScheduler:
             kv_pos = torch.cat([request.next_kv_pos for request in group], dim=0)
             slot_ids_list = [int(request.slot_id) for request in group]
             slot_ids = torch.cat([request.slot_id_tensor for request in group], dim=0)
-            previous_tokens = [
-                request.generated_token_buffer[:request.generated_token_count]
-                for request in group
-            ]
-            previous_token_masks = [request.previous_token_mask for request in group]
-            suppress_tokens = [
-                [eos_token] if request.generated_token_count < self.min_tokens_before_eos else None
-                for request in group
-            ]
+            active_slot_ids = slot_ids
+            if len(group) > 1:
+                previous_tokens = None
+                previous_token_masks = None
+                previous_token_mask_batch = self.previous_token_masks_by_slot.index_select(0, active_slot_ids)
+                suppress_eos = torch.tensor(
+                    [
+                        request.generated_token_count < self.min_tokens_before_eos
+                        for request in group
+                    ],
+                    device=self.device,
+                    dtype=torch.bool,
+                )
+                suppress_tokens = None
+            else:
+                previous_tokens = [
+                    request.generated_token_buffer[:request.generated_token_count]
+                    for request in group
+                ]
+                previous_token_masks = [request.previous_token_mask for request in group]
+                previous_token_mask_batch = None
+                suppress_eos = None
+                suppress_tokens = [
+                    [eos_token] if request.generated_token_count < self.min_tokens_before_eos else None
+                    for request in group
+                ]
             compiled_decode_fn, decode_bucket = self._select_compiled_decode(len(group))
             decode_mode = "compiled" if compiled_decode_fn is not None else "eager"
             active_count = len(group)
@@ -902,7 +923,9 @@ class ARScheduler:
                         slot_ids=slot_ids,
                         previous_tokens=previous_tokens,
                         previous_token_masks=previous_token_masks,
+                        previous_token_mask_batch=previous_token_mask_batch,
                         suppress_tokens=suppress_tokens,
+                        suppress_eos=suppress_eos,
                         compiled_decode_fn=compiled_decode_fn,
                         compiled_sample_fn=compiled_sample_fn,
                         active_count=active_count,
@@ -932,7 +955,9 @@ class ARScheduler:
                             slot_ids=slot_ids,
                             previous_tokens=previous_tokens,
                             previous_token_masks=previous_token_masks,
+                            previous_token_mask_batch=previous_token_mask_batch,
                             suppress_tokens=suppress_tokens,
+                            suppress_eos=suppress_eos,
                             compiled_decode_fn=compiled_decode_fn,
                             active_count=active_count,
                             top_p=top_p,
@@ -966,7 +991,9 @@ class ARScheduler:
                             slot_ids=torch.cat([request.slot_id_tensor for request in group], dim=0),
                             previous_tokens=previous_tokens,
                             previous_token_masks=previous_token_masks,
+                            previous_token_mask_batch=previous_token_mask_batch,
                             suppress_tokens=suppress_tokens,
+                            suppress_eos=suppress_eos,
                             top_p=top_p,
                             temperature=temperature,
                             repetition_penalty=repetition_penalty,
