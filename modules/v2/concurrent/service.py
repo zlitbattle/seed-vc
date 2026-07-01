@@ -1770,7 +1770,7 @@ class CFMScheduler:
         params: ConcurrentInferenceParams,
         random_voice: bool,
     ) -> torch.Tensor:
-        return self.vc_wrapper.cfm.inference(
+        return self.vc_wrapper.cfm_inference_fn(
             cat_condition,
             x_lens,
             target_mel,

@@ -530,9 +530,20 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
             args.ar_slots,
             FIXED_AR_SLOTS,
         )
-    if args.compile_ar or args.compile_ar_cudagraphs or args.compile_cfm or args.compile_cfm_cudagraphs:
+    if (
+        args.compile_ar
+        or args.compile_ar_cudagraphs
+        or args.compile_cfm
+        or args.compile_cfm_cudagraphs
+        or args.compile_cfm_full
+    ):
         configure_torch_compile()
-    if args.compile_cfm or args.compile_cfm_cudagraphs:
+    if args.compile_cfm_full:
+        vc_wrapper.compile_cfm_inference(
+            use_cudagraphs=args.compile_cfm_cudagraphs,
+            mode=args.compile_cfm_mode,
+        )
+    elif args.compile_cfm or args.compile_cfm_cudagraphs:
         vc_wrapper.compile_cfm(
             use_cudagraphs=args.compile_cfm_cudagraphs,
             mode=args.compile_cfm_mode,
@@ -661,6 +672,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("default", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune"),
         default=None,
         help="Optional torch.compile mode for CFM transformer; omitted preserves the legacy no-cudagraph path",
+    )
+    parser.add_argument(
+        "--compile-cfm-full",
+        action="store_true",
+        help="Experimental: compile the full CFM diffusion inference instead of only the transformer",
     )
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")

@@ -48,6 +48,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         self.overlap_frame_len = 16
         self.bitrate = "320k"
         self.compiled_decode_fn = None
+        self.cfm_inference_fn = self.cfm.inference
         self.dit_compiled = False
         self.dit_max_context_len = 30  # in seconds
         self.ar_max_content_len = 1500  # in num of narrow tokens
@@ -141,6 +142,30 @@ class VoiceConversionWrapper(torch.nn.Module):
             compile_kwargs.get("options", {}).get("triton.cudagraphs", "default"),
         )
         self.cfm.estimator.transformer = torch.compile(self.cfm.estimator.transformer, **compile_kwargs)
+        self.dit_compiled = True
+
+    def compile_cfm_inference(self, use_cudagraphs: bool = False, mode: str = None):
+        self.prepare_cfm_for_compile()
+        selected_mode = mode
+        if selected_mode == "default":
+            selected_mode = None
+        if selected_mode is None and torch.cuda.is_available() and use_cudagraphs:
+            selected_mode = "reduce-overhead"
+        compile_kwargs = {
+            "fullgraph": True,
+            "backend": "inductor" if torch.cuda.is_available() else "aot_eager",
+            "mode": selected_mode if torch.cuda.is_available() else None,
+        }
+        if torch.cuda.is_available() and not use_cudagraphs and selected_mode is None:
+            compile_kwargs.pop("mode", None)
+            compile_kwargs["options"] = {"triton.cudagraphs": False}
+        logger.info(
+            "stage=cfm_full_compile_config backend=%s mode=%s triton_cudagraphs=%s",
+            compile_kwargs["backend"],
+            compile_kwargs.get("mode"),
+            compile_kwargs.get("options", {}).get("triton.cudagraphs", "default"),
+        )
+        self.cfm_inference_fn = torch.compile(self.cfm.inference, **compile_kwargs)
         self.dit_compiled = True
 
     def prepare_cfm_for_compile(self):
