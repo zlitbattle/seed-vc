@@ -202,6 +202,7 @@ class ARScheduler:
         compile_decode_mode: Optional[str] = None,
         compile_sampling: bool = False,
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
+        compile_kv_buckets: Optional[Sequence[int]] = None,
         batch_wait_sec: float = 0.0,
         yield_every_steps: int = 1,
         eos_check_interval: int = 1,
@@ -236,7 +237,12 @@ class ARScheduler:
             int(batch_size) for batch_size in compile_batch_sizes
             if 1 <= int(batch_size) <= max_slots
         }))
-        self.compiled_decode_fns: Dict[int, Callable] = {}
+        kv_bucket_values = compile_kv_buckets or (max_seq_len,)
+        self.compile_kv_buckets = tuple(sorted({
+            int(bucket_len) for bucket_len in kv_bucket_values
+            if int(bucket_len) > 0 and int(bucket_len) <= max_seq_len
+        } | {int(max_seq_len)}))
+        self.compiled_decode_fns: Dict[Tuple[int, int], Callable] = {}
         self.compiled_sample_fns: Dict[int, Callable] = {}
         self.compile_failures = 0
         self.compile_fallbacks = 0
@@ -265,7 +271,10 @@ class ARScheduler:
                 self._build_compiled_sample_fns()
             logger.info(
                 "stage=ar_compile_enabled batches=%s max_slots=%s sample_compiled_batches=%s",
-                ",".join(str(batch_size) for batch_size in self.compiled_decode_fns),
+                ",".join(
+                    f"{batch_size}x{kv_bucket}"
+                    for batch_size, kv_bucket in sorted(self.compiled_decode_fns)
+                ),
                 self.max_slots,
                 ",".join(str(batch_size) for batch_size in sorted(self.compiled_sample_fns)) or "none",
             )
@@ -273,7 +282,7 @@ class ARScheduler:
             (
                 "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
                 "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s "
-                "batch_wait_sec=%.3f yield_every_steps=%s eos_check_interval=%s profiling=%s"
+                "compile_kv_buckets=%s batch_wait_sec=%.3f yield_every_steps=%s eos_check_interval=%s profiling=%s"
             ),
             self.max_slots,
             self.max_seq_len,
@@ -283,6 +292,7 @@ class ARScheduler:
             self.compile_decode_enabled,
             self.compile_decode_cudagraphs,
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
+            ",".join(str(bucket_len) for bucket_len in self.compile_kv_buckets) or "none",
             self.batch_wait_sec,
             self.yield_every_steps,
             self.eos_check_interval,
@@ -316,7 +326,10 @@ class ARScheduler:
             "stage=ar_scheduler_started max_slots=%s compile_enabled=%s compiled_batches=%s",
             self.max_slots,
             self.compile_decode_enabled,
-            ",".join(str(batch_size) for batch_size in sorted(self.compiled_decode_fns)) or "none",
+            ",".join(
+                f"{batch_size}x{kv_bucket}"
+                for batch_size, kv_bucket in sorted(self.compiled_decode_fns)
+            ) or "none",
         )
 
     async def stop(self) -> None:
@@ -353,19 +366,22 @@ class ARScheduler:
         )
         for batch_size in self.compile_batch_sizes:
             batch_size = int(batch_size)
+            for kv_bucket in self.compile_kv_buckets:
+                kv_bucket = int(kv_bucket)
 
-            def decode_forward(x, input_pos, kv_pos, slot_ids):
-                return self.ar_wrapper.model.forward_generate(
-                    x,
-                    input_pos,
-                    kv_pos,
-                    slot_ids=slot_ids,
+                def decode_forward(x, input_pos, kv_pos, slot_ids, *, attn_max_seq_len=kv_bucket):
+                    return self.ar_wrapper.model.forward_generate(
+                        x,
+                        input_pos,
+                        kv_pos,
+                        slot_ids=slot_ids,
+                        attn_max_seq_len=attn_max_seq_len,
+                    )
+
+                self.compiled_decode_fns[(batch_size, kv_bucket)] = torch.compile(
+                    decode_forward,
+                    **compile_kwargs,
                 )
-
-            self.compiled_decode_fns[batch_size] = torch.compile(
-                decode_forward,
-                **compile_kwargs,
-            )
 
     def _build_compiled_sample_fns(self) -> None:
         self.compiled_sample_fns.clear()
@@ -421,7 +437,7 @@ class ARScheduler:
         warmed_batches = []
         hidden_size = int(self.ar_wrapper.model.config.dim)
         input_dtype = self.ar_wrapper.sep_token_emb.dtype
-        for batch_size, compiled_fn in list(self.compiled_decode_fns.items()):
+        for (batch_size, kv_bucket), compiled_fn in list(self.compiled_decode_fns.items()):
             started_at = time.perf_counter()
             x = torch.zeros(
                 (batch_size, 1, hidden_size),
@@ -432,23 +448,29 @@ class ARScheduler:
             kv_pos = torch.zeros((batch_size, 1), device=self.device, dtype=torch.long)
             slot_ids = torch.arange(batch_size, device=self.device, dtype=torch.long)
             try:
-                logger.info("stage=warmup_ar_decode_start batch_size=%s", batch_size)
+                logger.info(
+                    "stage=warmup_ar_decode_start batch_size=%s kv_bucket=%s",
+                    batch_size,
+                    kv_bucket,
+                )
                 with self._autocast_context():
                     result = compiled_fn(x, input_pos, kv_pos, slot_ids)
                 synchronize_device(self.device)
                 del result
                 warmed_batches.append(batch_size)
                 logger.info(
-                    "stage=warmup_ar_decode_done batch_size=%s elapsed_sec=%.3f",
+                    "stage=warmup_ar_decode_done batch_size=%s kv_bucket=%s elapsed_sec=%.3f",
                     batch_size,
+                    kv_bucket,
                     time.perf_counter() - started_at,
                 )
             except Exception as exc:
                 self.compile_failures += 1
-                self.compiled_decode_fns.pop(batch_size, None)
+                self.compiled_decode_fns.pop((batch_size, kv_bucket), None)
                 logger.warning(
-                    "stage=warmup_ar_decode_failed batch_size=%s error_type=%s error=%s",
+                    "stage=warmup_ar_decode_failed batch_size=%s kv_bucket=%s error_type=%s error=%s",
                     batch_size,
+                    kv_bucket,
                     type(exc).__name__,
                     exc,
                 )
@@ -511,7 +533,10 @@ class ARScheduler:
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
             ",".join(str(batch_size) for batch_size in warmed_batches) or "none",
             self.compile_decode_enabled,
-            ",".join(str(batch_size) for batch_size in sorted(self.compiled_decode_fns)) or "none",
+            ",".join(
+                f"{batch_size}x{kv_bucket}"
+                for batch_size, kv_bucket in sorted(self.compiled_decode_fns)
+            ) or "none",
             self.compile_failures,
         )
         return warmed_batches
@@ -873,7 +898,10 @@ class ARScheduler:
                     [eos_token] if request.generated_token_count < self.min_tokens_before_eos else None
                     for request in group
                 ]
-            compiled_decode_fn, decode_bucket = self._select_compiled_decode(len(group))
+            compiled_decode_fn, decode_bucket, kv_bucket = self._select_compiled_decode(
+                len(group),
+                max(request.next_kv_pos_value + 1 for request in group),
+            )
             decode_mode = "compiled" if compiled_decode_fn is not None else "eager"
             active_count = len(group)
             padded_count = 0
@@ -906,6 +934,7 @@ class ARScheduler:
                 active_count=active_count,
                 batch_size=int(x.size(0)),
                 decode_bucket=decode_bucket,
+                kv_bucket=kv_bucket,
                 padded_count=padded_count,
                 top_p=top_p,
                 temperature=temperature,
@@ -969,7 +998,8 @@ class ARScheduler:
                         if compiled_decode_fn is None or decode_bucket is None:
                             raise
                         self.compile_fallbacks += 1
-                        self.compiled_decode_fns.pop(decode_bucket, None)
+                        if decode_bucket is not None and kv_bucket is not None:
+                            self.compiled_decode_fns.pop((decode_bucket, kv_bucket), None)
                         if not self.compiled_decode_fns:
                             self.compile_decode_enabled = False
                         logger.warning(
@@ -1072,6 +1102,7 @@ class ARScheduler:
         active_count: int,
         batch_size: int,
         decode_bucket: Optional[int],
+        kv_bucket: Optional[int],
         padded_count: int,
         top_p: float,
         temperature: float,
@@ -1079,7 +1110,7 @@ class ARScheduler:
     ) -> None:
         if not self.enable_profiling:
             return
-        route_key = f"{decode_mode}:{active_count}:{batch_size}:{decode_bucket}:{padded_count}"
+        route_key = f"{decode_mode}:{active_count}:{batch_size}:{decode_bucket}:{kv_bucket}:{padded_count}"
         changed_requests = [request for request in requests if request.last_decode_route != route_key]
         if not changed_requests:
             return
@@ -1088,13 +1119,15 @@ class ARScheduler:
         logger.info(
             (
                 "stage=ar_decode_route mode=%s active_count=%s batch_size=%s bucket=%s padded=%s "
-                "free_slots=%s requests=%s chunks=%s slots=%s top_p=%.3f temperature=%.3f repetition_penalty=%.3f"
+                "kv_bucket=%s free_slots=%s requests=%s chunks=%s slots=%s "
+                "top_p=%.3f temperature=%.3f repetition_penalty=%.3f"
             ),
             decode_mode,
             active_count,
             batch_size,
             decode_bucket if decode_bucket is not None else "none",
             padded_count,
+            kv_bucket if kv_bucket is not None else "none",
             len(self.free_slots),
             ",".join(request.request_id for request in requests),
             ",".join(str(request.chunk_index) for request in requests),
@@ -1109,13 +1142,27 @@ class ARScheduler:
             return torch.autocast(device_type=self.device.type, dtype=self.dtype)
         return nullcontext()
 
-    def _select_compiled_decode(self, active_count: int) -> Tuple[Optional[Callable], Optional[int]]:
+    def _select_compiled_decode(
+        self,
+        active_count: int,
+        required_kv_len: int,
+    ) -> Tuple[Optional[Callable], Optional[int], Optional[int]]:
         if not self.compile_decode_enabled:
-            return None, None
+            return None, None, None
+        selected_kv_bucket = None
+        for kv_bucket in self.compile_kv_buckets:
+            if required_kv_len <= kv_bucket:
+                selected_kv_bucket = kv_bucket
+                break
+        if selected_kv_bucket is None:
+            return None, None, None
         for batch_size in sorted(self.compiled_decode_fns):
-            if active_count <= batch_size:
-                return self.compiled_decode_fns[batch_size], batch_size
-        return None, None
+            compiled_batch_size, kv_bucket = batch_size
+            if kv_bucket != selected_kv_bucket:
+                continue
+            if active_count <= compiled_batch_size:
+                return self.compiled_decode_fns[batch_size], compiled_batch_size, kv_bucket
+        return None, None, None
 
     def _pad_decode_batch(
         self,
@@ -1250,7 +1297,11 @@ class ARScheduler:
             "completed": self.completed,
             "failed": self.failed,
             "compile_decode_enabled": int(self.compile_decode_enabled),
-            "compiled_decode_batches": list(sorted(self.compiled_decode_fns)),
+            "compiled_decode_batches": [
+                f"{batch_size}x{kv_bucket}"
+                for batch_size, kv_bucket in sorted(self.compiled_decode_fns)
+            ],
+            "compiled_decode_kv_buckets": list(self.compile_kv_buckets),
             "compile_sample_enabled": int(bool(self.compiled_sample_fns)),
             "compiled_sample_batches": list(sorted(self.compiled_sample_fns)),
             "compile_failures": self.compile_failures,
@@ -1905,6 +1956,7 @@ class ConcurrentVoiceConversionService:
         compile_ar_cudagraphs: bool = False,
         compile_ar_mode: Optional[str] = None,
         compile_ar_sampling: bool = False,
+        ar_decode_kv_buckets: Optional[Sequence[int]] = None,
     ):
         self.vc_wrapper = vc_wrapper
         self.device = device
@@ -1923,6 +1975,7 @@ class ConcurrentVoiceConversionService:
             compile_decode_cudagraphs=compile_ar_cudagraphs,
             compile_decode_mode=compile_ar_mode,
             compile_sampling=compile_ar_sampling,
+            compile_kv_buckets=ar_decode_kv_buckets,
             batch_wait_sec=ar_batch_wait_sec,
             yield_every_steps=ar_yield_every_steps,
             eos_check_interval=ar_eos_check_interval,

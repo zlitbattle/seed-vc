@@ -80,7 +80,14 @@ class KVCache(nn.Module):
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val, slot_ids: Optional[Union[Tensor, Sequence[int]]] = None):
+    def update(
+        self,
+        input_pos,
+        k_val,
+        v_val,
+        slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
+        cache_max_seq_len: Optional[int] = None,
+    ):
         # input_pos: [S], k_val: [B, H, S, D]
         if input_pos.dim() == 1:
             assert input_pos.shape[0] == k_val.shape[2]
@@ -100,6 +107,8 @@ class KVCache(nn.Module):
                     positions = input_pos[batch_idx]
                     k_out[batch_idx, :, positions] = k_val[batch_idx]
                     v_out[batch_idx, :, positions] = v_val[batch_idx]
+            if cache_max_seq_len is not None:
+                return k_out[:k_val.size(0), :, :cache_max_seq_len], v_out[:v_val.size(0), :, :cache_max_seq_len]
             return k_out[:k_val.size(0)], v_out[:v_val.size(0)]
 
         if not torch.is_tensor(slot_ids):
@@ -118,6 +127,8 @@ class KVCache(nn.Module):
                 k_out[slot_ids[batch_idx], :, positions[batch_idx]] = k_val[batch_idx]
                 v_out[slot_ids[batch_idx], :, positions[batch_idx]] = v_val[batch_idx]
 
+        if cache_max_seq_len is not None:
+            return k_out[slot_ids, :, :cache_max_seq_len], v_out[slot_ids, :, :cache_max_seq_len]
         return k_out[slot_ids], v_out[slot_ids]
 
 
@@ -275,11 +286,12 @@ class BaseTransformer(nn.Module):
         kv_pos: Optional[Tensor] = None,
         return_all: bool = False,
         slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
+        attn_max_seq_len: Optional[int] = None,
     ) -> BaseTransformerForwardResult:
         # This is used for generation, optimized for torch compile
 
         x = inp
-        max_seq_len = self.max_seq_len
+        max_seq_len = self.max_seq_len if attn_max_seq_len is None else int(attn_max_seq_len)
 
         mask = self.causal_mask[kv_pos, :max_seq_len]
         if kv_pos.dim() == 1:
@@ -291,7 +303,14 @@ class BaseTransformer(nn.Module):
             freqs_cis = freqs_cis.unsqueeze(0).expand(inp.size(0), -1, -1, -1)
 
         for layer in self.layers:
-            x = layer(x, freqs_cis, mask, input_pos=kv_pos, slot_ids=slot_ids)
+            x = layer(
+                x,
+                freqs_cis,
+                mask,
+                input_pos=kv_pos,
+                slot_ids=slot_ids,
+                cache_max_seq_len=max_seq_len,
+            )
 
         x = x[:, -1:]
 
@@ -363,8 +382,16 @@ class NaiveTransformer(BaseTransformer):
         kv_pos: Optional[Tensor] = None,
         vq_masks: Optional[Tensor] = None,
         slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
+        attn_max_seq_len: Optional[int] = None,
     ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos, kv_pos, vq_masks, slot_ids=slot_ids)
+        x = super().forward_generate(
+            x,
+            input_pos,
+            kv_pos,
+            vq_masks,
+            slot_ids=slot_ids,
+            attn_max_seq_len=attn_max_seq_len,
+        )
         return x
 
 class NaiveWrapper(nn.Module):
@@ -630,8 +657,16 @@ class TransformerBlock(nn.Module):
         mask: Tensor,
         input_pos: Tensor = None,
         slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
+        cache_max_seq_len: Optional[int] = None,
     ) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, slot_ids=slot_ids)
+        h = x + self.attention(
+            self.attention_norm(x),
+            freqs_cis,
+            mask,
+            input_pos,
+            slot_ids=slot_ids,
+            cache_max_seq_len=cache_max_seq_len,
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -679,6 +714,7 @@ class Attention(nn.Module):
         mask: Tensor,
         input_pos: Optional[Tensor] = None,
         slot_ids: Optional[Union[Tensor, Sequence[int]]] = None,
+        cache_max_seq_len: Optional[int] = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -703,7 +739,13 @@ class Attention(nn.Module):
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v, slot_ids=slot_ids)
+            k, v = self.kv_cache.update(
+                input_pos,
+                k,
+                v,
+                slot_ids=slot_ids,
+                cache_max_seq_len=cache_max_seq_len,
+            )
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)

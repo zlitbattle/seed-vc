@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -92,6 +92,13 @@ def parse_dtype(name: str) -> torch.dtype:
     if name not in mapping:
         raise ValueError(f"Unsupported dtype: {name}")
     return mapping[name]
+
+
+def parse_int_csv(value: str) -> Optional[Tuple[int, ...]]:
+    if not value:
+        return None
+    parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    return parsed or None
 
 
 service: Optional[ConcurrentVoiceConversionService] = None
@@ -644,6 +651,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Check AR EOS every N decode steps; 1 preserves exact per-token EOS checking",
     )
+    parser.add_argument(
+        "--ar-decode-kv-buckets",
+        type=str,
+        default="",
+        help="Comma-separated AR attention KV decode buckets, e.g. 2048,4096. Defaults to ar-max-seq-len only.",
+    )
     parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument(
         "--compile-ar-cudagraphs",
@@ -709,6 +722,7 @@ async def initialize_service(args) -> None:
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
         compile_ar_mode=args.compile_ar_mode,
         compile_ar_sampling=args.compile_ar_sampling,
+        ar_decode_kv_buckets=parse_int_csv(args.ar_decode_kv_buckets),
     )
     warmed_ar_batches = await service.warmup_ar_decode()
     if warmed_ar_batches:
