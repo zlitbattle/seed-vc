@@ -234,12 +234,15 @@ class VoiceConversionWrapper(torch.nn.Module):
     @staticmethod
     def crossfade(chunk1, chunk2, overlap):
         """Apply crossfade between two audio chunks."""
-        fade_out = np.cos(np.linspace(0, np.pi / 2, overlap)) ** 2
-        fade_in = np.cos(np.linspace(np.pi / 2, 0, overlap)) ** 2
-        if len(chunk2) < overlap:
-            chunk2[:overlap] = chunk2[:overlap] * fade_in[:len(chunk2)] + (chunk1[-overlap:] * fade_out)[:len(chunk2)]
-        else:
-            chunk2[:overlap] = chunk2[:overlap] * fade_in + chunk1[-overlap:] * fade_out
+        effective_overlap = min(int(overlap), len(chunk1), len(chunk2))
+        if effective_overlap <= 0:
+            return chunk2
+        fade_out = np.cos(np.linspace(0, np.pi / 2, effective_overlap)) ** 2
+        fade_in = np.cos(np.linspace(np.pi / 2, 0, effective_overlap)) ** 2
+        chunk2[:effective_overlap] = (
+            chunk2[:effective_overlap] * fade_in
+            + chunk1[-effective_overlap:] * fade_out
+        )
         return chunk2
 
     def _stream_wave_chunks(self, vc_wave, processed_frames, vc_mel, overlap_wave_len, 
