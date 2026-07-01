@@ -72,6 +72,22 @@ class CFM(torch.nn.Module):
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
+        if (
+            not random_voice
+            and not all(i == 0 for i in inference_cfg_rate)
+            and inference_cfg_rate[0] != 0
+            and inference_cfg_rate[1] != 0
+        ):
+            prompt_cfg = torch.cat([prompt_x, torch.zeros_like(prompt_x), torch.zeros_like(prompt_x)], dim=0)
+            x_lens_cfg = torch.cat([x_lens, x_lens, x_lens], dim=0)
+            style_cfg = torch.cat([style, torch.zeros_like(style), torch.zeros_like(style)], dim=0)
+            mu_cfg = torch.cat([mu, mu, torch.zeros_like(mu)], dim=0)
+        else:
+            prompt_cfg = None
+            x_lens_cfg = None
+            style_cfg = None
+            mu_cfg = None
+
         for step in range(1, len(t_span)):
             t_batch = t.expand(x.size(0))
             if random_voice:
@@ -114,11 +130,11 @@ class CFM(torch.nn.Module):
                 # Multi-condition Classifier-Free Guidance inference introduced in MegaTTS3
                 cfg_dphi_dt = self.estimator(
                     torch.cat([x, x, x], dim=0),
-                    torch.cat([prompt_x, torch.zeros_like(prompt_x), torch.zeros_like(prompt_x)], dim=0),
-                    torch.cat([x_lens, x_lens, x_lens], dim=0),
-                    torch.cat([t_batch, t_batch, t_batch], dim=0),
-                    torch.cat([style, torch.zeros_like(style), torch.zeros_like(style)], dim=0),
-                    torch.cat([mu, mu, torch.zeros_like(mu)], dim=0),
+                    prompt_cfg,
+                    x_lens_cfg,
+                    t.expand(x.size(0) * 3),
+                    style_cfg,
+                    mu_cfg,
                 )
                 cond_txt_spk, cond_txt, uncond = cfg_dphi_dt.chunk(3, dim=0)
                 dphi_dt = (1.0 + inference_cfg_rate[0] + inference_cfg_rate[1]) * cond_txt_spk - \
