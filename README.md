@@ -83,3 +83,11 @@ Useful endpoints:
 - `GET /health`
 - `GET /metrics`
 - `POST /v2/convert`
+
+Production guard options:
+
+- `--max-upload-mb`: reject oversized uploaded files before inference.
+- `--max-source-sec` / `--max-target-sec`: reject audio that exceeds the configured duration.
+- `--ar-max-pending-requests` / `--cfm-max-pending-jobs`: return HTTP 503 instead of allowing unbounded queue growth.
+- `--ar-max-chunks-in-flight-per-request`: prevent one very long request from occupying all AR slots at once.
+- `--timbre-cache-size 0`: disable target timbre cache when reference audio rarely repeats.

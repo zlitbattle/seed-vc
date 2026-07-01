@@ -23,6 +23,10 @@ CFM_BATCH_MAX_SIZE = 4
 CFM_BATCH_WAIT_SEC = 0.18
 
 
+class ServiceBusyError(RuntimeError):
+    """Raised when scheduler backpressure rejects a request."""
+
+
 def synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -110,7 +114,7 @@ class CFMJob:
 
 class TimbreFeatureCache:
     def __init__(self, max_size: int = 20):
-        self.max_size = max_size
+        self.max_size = max(0, int(max_size))
         self._items: "OrderedDict[str, TimbreFeatures]" = OrderedDict()
         self.hits = 0
         self.misses = 0
@@ -125,6 +129,8 @@ class TimbreFeatureCache:
         return item
 
     def put(self, key: str, features: TimbreFeatures) -> None:
+        if self.max_size <= 0:
+            return
         self._items[key] = features
         self._items.move_to_end(key)
         while len(self._items) > self.max_size:
@@ -149,7 +155,7 @@ class TimbreFeatureCache:
 
 class SourceFeatureCache:
     def __init__(self, max_size: int = 64):
-        self.max_size = max_size
+        self.max_size = max(0, int(max_size))
         self._items: "OrderedDict[str, SourceFeatures]" = OrderedDict()
         self.hits = 0
         self.misses = 0
@@ -164,6 +170,8 @@ class SourceFeatureCache:
         return item
 
     def put(self, key: str, features: SourceFeatures) -> None:
+        if self.max_size <= 0:
+            return
         self._items[key] = features
         self._items.move_to_end(key)
         while len(self._items) > self.max_size:
@@ -206,6 +214,7 @@ class ARScheduler:
         batch_wait_sec: float = 0.0,
         yield_every_steps: int = 1,
         eos_check_interval: int = 1,
+        max_pending_requests: int = 0,
         feature_inflight_getter: Optional[Callable[[], int]] = None,
     ):
         self.ar_wrapper = ar_wrapper
@@ -224,6 +233,7 @@ class ARScheduler:
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
         self.yield_every_steps = max(1, int(yield_every_steps))
         self.eos_check_interval = max(1, int(eos_check_interval))
+        self.max_pending_requests = max(0, int(max_pending_requests))
         self._decode_steps_since_yield = 0
         self.feature_inflight_getter = feature_inflight_getter
         self._batch_wait_logged = False
@@ -249,6 +259,7 @@ class ARScheduler:
         self.sample_compile_failures = 0
         self.sample_compile_fallbacks = 0
         self.waiting_queue: "asyncio.Queue[ARGenerateRequest]" = asyncio.Queue()
+        self._submit_lock = asyncio.Lock()
         self.active: List[ARGenerateRequest] = []
         self.free_slots = list(range(max_slots))
         self.previous_token_masks_by_slot = torch.zeros(
@@ -282,7 +293,8 @@ class ARScheduler:
             (
                 "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
                 "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s "
-                "compile_kv_buckets=%s batch_wait_sec=%.3f yield_every_steps=%s eos_check_interval=%s profiling=%s"
+                "compile_kv_buckets=%s batch_wait_sec=%.3f yield_every_steps=%s eos_check_interval=%s "
+                "max_pending_requests=%s profiling=%s"
             ),
             self.max_slots,
             self.max_seq_len,
@@ -296,6 +308,7 @@ class ARScheduler:
             self.batch_wait_sec,
             self.yield_every_steps,
             self.eos_check_interval,
+            self.max_pending_requests,
             self.enable_profiling,
         )
 
@@ -542,23 +555,41 @@ class ARScheduler:
         return warmed_batches
 
     async def submit(self, request: ARGenerateRequest) -> torch.Tensor:
-        request.future = asyncio.get_running_loop().create_future()
-        request.queued_at = time.perf_counter()
-        logger.info(
-            (
-                "request=%s stage=ar_queue_submit chunk=%s queue_size=%s active=%s free_slots=%s "
-                "prompt_text_len=%s prompt_target_len=%s"
-            ),
-            request.request_id,
-            request.chunk_index,
-            self.waiting_queue.qsize(),
-            len(self.active),
-            len(self.free_slots),
-            request.prompt_text.size(1),
-            request.prompt_target.size(-1),
-        )
-        await self.waiting_queue.put(request)
-        return await request.future
+        results = await self.submit_many([request])
+        return results[0]
+
+    async def submit_many(self, requests: Sequence[ARGenerateRequest]) -> List[torch.Tensor]:
+        if not requests:
+            return []
+        loop = asyncio.get_running_loop()
+        async with self._submit_lock:
+            pending_after_submit = self._pending_count() + len(requests)
+            if self.max_pending_requests > 0 and pending_after_submit > self.max_pending_requests:
+                raise ServiceBusyError(
+                    "AR scheduler is busy: "
+                    f"pending_after_submit={pending_after_submit} max_pending={self.max_pending_requests}"
+                )
+            for request in requests:
+                request.future = loop.create_future()
+                request.queued_at = time.perf_counter()
+                logger.info(
+                    (
+                        "request=%s stage=ar_queue_submit chunk=%s queue_size=%s active=%s free_slots=%s "
+                        "prompt_text_len=%s prompt_target_len=%s"
+                    ),
+                    request.request_id,
+                    request.chunk_index,
+                    self.waiting_queue.qsize(),
+                    len(self.active),
+                    len(self.free_slots),
+                    request.prompt_text.size(1),
+                    request.prompt_target.size(-1),
+                )
+                await self.waiting_queue.put(request)
+        return await asyncio.gather(*(request.future for request in requests if request.future is not None))
+
+    def _pending_count(self) -> int:
+        return self.waiting_queue.qsize() + len(self.active)
 
     async def _schedule_loop(self) -> None:
         while self._running:
@@ -1339,6 +1370,7 @@ class CFMScheduler:
         batch_max_size: int = CFM_BATCH_MAX_SIZE,
         batch_wait_sec: float = CFM_BATCH_WAIT_SEC,
         run_inline: bool = False,
+        max_pending_jobs: int = 0,
     ):
         self.vc_wrapper = vc_wrapper
         self.device = device
@@ -1348,7 +1380,9 @@ class CFMScheduler:
         self.batch_max_size = max(1, int(batch_max_size))
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
         self.run_inline = bool(run_inline)
+        self.max_pending_jobs = max(0, int(max_pending_jobs))
         self.queue: "asyncio.Queue[CFMJob]" = asyncio.Queue()
+        self._submit_lock = asyncio.Lock()
         self._deferred_jobs: Deque[CFMJob] = deque()
         self._tasks: List[asyncio.Task] = []
         self._running = False
@@ -1370,12 +1404,16 @@ class CFMScheduler:
                 thread_name_prefix="seed-vc-cfm",
             )
         logger.info(
-            "stage=cfm_executor_started workers=%s run_inline=%s dit_compiled=%s batch_max_size=%s batch_wait_sec=%.3f",
+            (
+                "stage=cfm_executor_started workers=%s run_inline=%s dit_compiled=%s "
+                "batch_max_size=%s batch_wait_sec=%.3f max_pending_jobs=%s"
+            ),
             executor_workers,
             self.run_inline,
             self.vc_wrapper.dit_compiled,
             self.batch_max_size,
             self.batch_wait_sec,
+            self.max_pending_jobs,
         )
         for _ in range(self.max_concurrent):
             self._tasks.append(asyncio.create_task(self._worker()))
@@ -1395,16 +1433,26 @@ class CFMScheduler:
             self._executor = None
 
     async def submit(self, job: CFMJob) -> Tuple[int, np.ndarray]:
-        job.future = asyncio.get_running_loop().create_future()
-        logger.info(
-            "request=%s stage=cfm_queue_submit queue_size=%s active=%s max_concurrent=%s",
-            job.request_id,
-            self.queue.qsize(),
-            self.active,
-            self.max_concurrent,
-        )
-        await self.queue.put(job)
+        async with self._submit_lock:
+            pending_after_submit = self._pending_count() + 1
+            if self.max_pending_jobs > 0 and pending_after_submit > self.max_pending_jobs:
+                raise ServiceBusyError(
+                    "CFM scheduler is busy: "
+                    f"pending_after_submit={pending_after_submit} max_pending={self.max_pending_jobs}"
+                )
+            job.future = asyncio.get_running_loop().create_future()
+            logger.info(
+                "request=%s stage=cfm_queue_submit queue_size=%s active=%s max_concurrent=%s",
+                job.request_id,
+                self.queue.qsize(),
+                self.active,
+                self.max_concurrent,
+            )
+            await self.queue.put(job)
         return await job.future
+
+    def _pending_count(self) -> int:
+        return self.queue.qsize() + len(self._deferred_jobs) + self.active
 
     async def _worker(self) -> None:
         while self._running:
@@ -1937,6 +1985,7 @@ class CFMScheduler:
             "batch_max_size": self.batch_max_size,
             "batch_wait_sec": self.batch_wait_sec,
             "run_inline": int(self.run_inline),
+            "max_pending_jobs": self.max_pending_jobs,
             "active_cfm": self.active,
             "queue_length": self.queue.qsize(),
             "deferred_length": len(self._deferred_jobs),
@@ -1965,6 +2014,9 @@ class ConcurrentVoiceConversionService:
         ar_batch_wait_sec: float = 0.0,
         ar_yield_every_steps: int = 1,
         ar_eos_check_interval: int = 1,
+        ar_max_pending_requests: int = 0,
+        ar_max_chunks_in_flight_per_request: int = 0,
+        cfm_max_pending_jobs: int = 0,
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
@@ -1977,6 +2029,7 @@ class ConcurrentVoiceConversionService:
         self.dtype = dtype
         self.enable_profiling = enable_profiling
         self.feature_max_concurrent = max(1, int(feature_max_concurrent))
+        self.ar_max_chunks_in_flight_per_request = max(0, int(ar_max_chunks_in_flight_per_request))
         self._feature_inflight = 0
         self.ar_scheduler = ARScheduler(
             vc_wrapper.ar,
@@ -1993,6 +2046,7 @@ class ConcurrentVoiceConversionService:
             batch_wait_sec=ar_batch_wait_sec,
             yield_every_steps=ar_yield_every_steps,
             eos_check_interval=ar_eos_check_interval,
+            max_pending_requests=ar_max_pending_requests,
             feature_inflight_getter=self._get_feature_inflight,
         )
         self.cfm_scheduler = CFMScheduler(
@@ -2004,6 +2058,7 @@ class ConcurrentVoiceConversionService:
             batch_max_size=cfm_batch_max_size,
             batch_wait_sec=cfm_batch_wait_sec,
             run_inline=cfm_inline,
+            max_pending_jobs=cfm_max_pending_jobs,
         )
         self.timbre_cache = TimbreFeatureCache(max_size=timbre_cache_size)
         self.source_cache = SourceFeatureCache(max_size=source_cache_size)
@@ -2083,9 +2138,7 @@ class ConcurrentVoiceConversionService:
                 )
                 for chunk_index, (prompt_text, prompt_target) in enumerate(ar_chunks)
             ]
-            ar_outputs = await asyncio.gather(*(
-                self.ar_scheduler.submit(ar_request) for ar_request in ar_requests
-            ))
+            ar_outputs = await self._submit_ar_requests(ar_requests)
             ar_sec = time.perf_counter() - ar_started_at
             generated_tokens = sum(int(output.size(-1)) for output in ar_outputs)
             logger.info(
@@ -2114,6 +2167,19 @@ class ConcurrentVoiceConversionService:
             len(waveform),
         )
         return request_id, sample_rate, waveform
+
+    async def _submit_ar_requests(self, ar_requests: Sequence[ARGenerateRequest]) -> List[torch.Tensor]:
+        if not ar_requests:
+            return []
+        max_in_flight = self.ar_max_chunks_in_flight_per_request
+        if max_in_flight <= 0 or len(ar_requests) <= max_in_flight:
+            return await self.ar_scheduler.submit_many(ar_requests)
+
+        outputs: List[torch.Tensor] = []
+        for start in range(0, len(ar_requests), max_in_flight):
+            batch = ar_requests[start:start + max_in_flight]
+            outputs.extend(await self.ar_scheduler.submit_many(batch))
+        return outputs
 
     async def _prepare_features_async(
         self,
@@ -2163,6 +2229,15 @@ class ConcurrentVoiceConversionService:
         source_audio_path: str,
         require_narrow: bool,
     ) -> SourceFeatures:
+        if self.source_cache.max_size <= 0:
+            logger.info("request=%s stage=source_cache_disabled", request_id)
+            return await asyncio.to_thread(
+                self._compute_source_features,
+                request_id,
+                source_audio_path,
+                require_narrow,
+            )
+
         cache_key = self._source_feature_cache_key(source_audio_path, require_narrow)
         cached = self.source_cache.get(cache_key)
         if cached is not None:
@@ -2227,6 +2302,18 @@ class ConcurrentVoiceConversionService:
         return source, timbre
 
     def _get_or_compute_timbre_features(self, request_id: str, target_audio_path: str) -> TimbreFeatures:
+        if self.timbre_cache.max_size <= 0:
+            logger.info("request=%s stage=timbre_cache_disabled", request_id)
+            cache_key = f"disabled:{Path(target_audio_path).name}:{time.perf_counter_ns()}"
+            compute_started_at = time.perf_counter()
+            features = self._compute_timbre_features(request_id, cache_key, target_audio_path)
+            logger.info(
+                "request=%s stage=timbre_compute_done elapsed_sec=%.3f",
+                request_id,
+                time.perf_counter() - compute_started_at,
+            )
+            return features
+
         md5_started_at = time.perf_counter()
         cache_key = self._target_audio_cache_key(target_audio_path)
         logger.info(
@@ -2264,8 +2351,8 @@ class ConcurrentVoiceConversionService:
     @torch.inference_mode()
     def _compute_timbre_features(self, request_id: str, cache_key: str, target_audio_path: str) -> TimbreFeatures:
         load_started_at = time.perf_counter()
-        target_wave = librosa.load(target_audio_path, sr=self.vc_wrapper.sr)[0]
-        target_wave = target_wave[: self.vc_wrapper.sr * (self.vc_wrapper.dit_max_context_len - 5)]
+        max_target_sec = max(0.0, float(self.vc_wrapper.dit_max_context_len - 5))
+        target_wave = librosa.load(target_audio_path, sr=self.vc_wrapper.sr, duration=max_target_sec)[0]
         load_sec = time.perf_counter() - load_started_at
         tensor_started_at = time.perf_counter()
         target_wave_tensor = torch.tensor(target_wave).unsqueeze(0).float().to(self.device)
@@ -2634,5 +2721,8 @@ class ConcurrentVoiceConversionService:
             "feature_extraction": {
                 "max_concurrent": self.feature_max_concurrent,
                 "inflight": self._feature_inflight,
+            },
+            "limits": {
+                "ar_max_chunks_in_flight_per_request": self.ar_max_chunks_in_flight_per_request,
             },
         }

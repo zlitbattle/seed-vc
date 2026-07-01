@@ -24,7 +24,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
 
-from modules.v2.concurrent import ConcurrentInferenceParams, ConcurrentVoiceConversionService
+from modules.v2.concurrent import ConcurrentInferenceParams, ConcurrentVoiceConversionService, ServiceBusyError
 
 
 logger = logging.getLogger(__name__)
@@ -171,14 +171,26 @@ async def convert(
         convert_style=convert_style,
         anonymization_only=anonymization_only,
     )
+    validate_inference_params(params)
 
     temp_dir_path = Path(tempfile.mkdtemp(prefix="seed_vc_convert_"))
     try:
         source_path = temp_dir_path / f"source{source_suffix}"
         target_path = temp_dir_path / f"target{target_suffix}"
         upload_started_at = time.perf_counter()
-        await save_upload_file(source_audio_file, source_path)
-        await save_upload_file(target_audio_file, target_path)
+        max_upload_mb = float(getattr(server_args, "max_upload_mb", 0.0))
+        await save_upload_file(source_audio_file, source_path, max_upload_mb, "source_audio_file")
+        await save_upload_file(target_audio_file, target_path, max_upload_mb, "target_audio_file")
+        await validate_audio_duration(
+            source_path,
+            float(getattr(server_args, "max_source_sec", 0.0)),
+            "source_audio_file",
+        )
+        await validate_audio_duration(
+            target_path,
+            float(getattr(server_args, "max_target_sec", 0.0)),
+            "target_audio_file",
+        )
         logger.info(
             "stage=upload_saved upload_sec=%.3f source_bytes=%s target_bytes=%s output_format=%s",
             time.perf_counter() - upload_started_at,
@@ -193,6 +205,9 @@ async def convert(
                 str(target_path),
                 params,
             )
+        except ServiceBusyError as exc:
+            logger.warning("stage=convert_rejected reason=busy detail=%s", exc)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("stage=convert_failed error_type=%s", type(exc).__name__)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -256,15 +271,79 @@ def validate_input_file(upload_file: UploadFile, field_name: str) -> str:
     return suffix
 
 
-async def save_upload_file(upload_file: UploadFile, destination: Path) -> None:
+async def save_upload_file(
+    upload_file: UploadFile,
+    destination: Path,
+    max_upload_mb: float,
+    field_name: str,
+) -> None:
+    max_upload_bytes = int(max_upload_mb * 1024 * 1024) if max_upload_mb and max_upload_mb > 0 else 0
+    bytes_written = 0
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as output_file:
-        while True:
-            chunk = await upload_file.read(1024 * 1024)
-            if not chunk:
-                break
-            output_file.write(chunk)
-    await upload_file.close()
+    try:
+        with destination.open("wb") as output_file:
+            while True:
+                chunk = await upload_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if max_upload_bytes > 0 and bytes_written > max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"{field_name} is too large: "
+                            f"{bytes_written / 1024 / 1024:.1f} MiB > {max_upload_mb:.1f} MiB"
+                        ),
+                    )
+                output_file.write(chunk)
+    finally:
+        await upload_file.close()
+
+
+def validate_inference_params(params: ConcurrentInferenceParams) -> None:
+    if not 1 <= params.diffusion_steps <= 100:
+        raise HTTPException(status_code=400, detail="diffusion_steps must be between 1 and 100")
+    if not 0.25 <= params.length_adjust <= 4.0:
+        raise HTTPException(status_code=400, detail="length_adjust must be between 0.25 and 4.0")
+    if not 0.0 <= params.intelligibility_cfg_rate <= 2.0:
+        raise HTTPException(status_code=400, detail="intelligibility_cfg_rate must be between 0.0 and 2.0")
+    if not 0.0 <= params.similarity_cfg_rate <= 2.0:
+        raise HTTPException(status_code=400, detail="similarity_cfg_rate must be between 0.0 and 2.0")
+    if not 0.05 <= params.top_p <= 1.0:
+        raise HTTPException(status_code=400, detail="top_p must be between 0.05 and 1.0")
+    if not 0.05 <= params.temperature <= 2.0:
+        raise HTTPException(status_code=400, detail="temperature must be between 0.05 and 2.0")
+    if not 1.0 <= params.repetition_penalty <= 3.0:
+        raise HTTPException(status_code=400, detail="repetition_penalty must be between 1.0 and 3.0")
+
+
+async def validate_audio_duration(audio_path: Path, max_duration_sec: float, field_name: str) -> None:
+    if not max_duration_sec or max_duration_sec <= 0:
+        return
+    try:
+        duration_sec = await asyncio.to_thread(read_audio_duration_sec, audio_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"failed to inspect {field_name}: {exc}") from exc
+    if duration_sec > max_duration_sec:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{field_name} is too long: "
+                f"{duration_sec:.1f}s > {max_duration_sec:.1f}s"
+            ),
+        )
+
+
+def read_audio_duration_sec(audio_path: Path) -> float:
+    try:
+        info = sf.info(str(audio_path))
+        if info.samplerate <= 0:
+            raise ValueError("invalid sample rate")
+        return float(info.frames) / float(info.samplerate)
+    except Exception:
+        import librosa
+
+        return float(librosa.get_duration(path=str(audio_path)))
 
 
 def validate_output_format(output_format: str) -> str:
@@ -653,8 +732,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfm-max-concurrent", type=int, default=1)
     parser.add_argument("--timbre-cache-size", type=int, default=20)
     parser.add_argument("--source-cache-size", type=int, default=64)
+    parser.add_argument(
+        "--max-upload-mb",
+        type=float,
+        default=0.0,
+        help="Reject each uploaded file above this size in MiB; 0 disables the limit",
+    )
+    parser.add_argument(
+        "--max-source-sec",
+        type=float,
+        default=0.0,
+        help="Reject source audio longer than this many seconds; 0 disables the limit",
+    )
+    parser.add_argument(
+        "--max-target-sec",
+        type=float,
+        default=0.0,
+        help="Reject target audio longer than this many seconds; 0 disables the limit",
+    )
     parser.add_argument("--cfm-batch-max-size", type=int, default=4)
     parser.add_argument("--cfm-batch-wait-sec", type=float, default=0.18)
+    parser.add_argument(
+        "--cfm-max-pending-jobs",
+        type=int,
+        default=0,
+        help="Reject new CFM jobs when queued+active jobs exceed this limit; 0 disables the limit",
+    )
     parser.add_argument(
         "--cfm-inline",
         action="store_true",
@@ -684,6 +787,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Comma-separated AR attention KV decode buckets, e.g. 2048,4096. Defaults to ar-max-seq-len only.",
+    )
+    parser.add_argument(
+        "--ar-max-pending-requests",
+        type=int,
+        default=0,
+        help="Reject new AR chunks when queued+active chunks exceed this limit; 0 disables the limit",
+    )
+    parser.add_argument(
+        "--ar-max-chunks-in-flight-per-request",
+        type=int,
+        default=0,
+        help="Limit how many AR chunks a single long request may submit at once; 0 submits all chunks",
     )
     parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument(
@@ -745,6 +860,9 @@ async def initialize_service(args) -> None:
         ar_batch_wait_sec=args.ar_batch_wait_sec,
         ar_yield_every_steps=args.ar_yield_every_steps,
         ar_eos_check_interval=args.ar_eos_check_interval,
+        ar_max_pending_requests=args.ar_max_pending_requests,
+        ar_max_chunks_in_flight_per_request=args.ar_max_chunks_in_flight_per_request,
+        cfm_max_pending_jobs=args.cfm_max_pending_jobs,
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
