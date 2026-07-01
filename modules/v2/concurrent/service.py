@@ -2244,7 +2244,7 @@ class ConcurrentVoiceConversionService:
         audio_key = self._target_audio_cache_key(source_audio_path)
         return f"{audio_key}:narrow={int(require_narrow)}"
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _compute_timbre_features(self, request_id: str, cache_key: str, target_audio_path: str) -> TimbreFeatures:
         load_started_at = time.perf_counter()
         target_wave = librosa.load(target_audio_path, sr=self.vc_wrapper.sr)[0]
@@ -2330,7 +2330,7 @@ class ConcurrentVoiceConversionService:
             prompt_condition=prompt_condition,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _compute_source_features(self, request_id: str, source_audio_path: str, require_narrow: bool) -> SourceFeatures:
         load_started_at = time.perf_counter()
         source_wave = librosa.load(source_audio_path, sr=self.vc_wrapper.sr)[0]
