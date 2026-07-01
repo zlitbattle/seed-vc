@@ -618,6 +618,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Wait briefly for in-flight feature extraction before AR decode batching",
     )
+    parser.add_argument(
+        "--ar-yield-every-steps",
+        type=int,
+        default=1,
+        help="Yield the asyncio loop every N AR decode steps; 1 preserves the original scheduler behavior",
+    )
     parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument(
         "--compile-ar-cudagraphs",
@@ -659,6 +665,7 @@ async def initialize_service(args) -> None:
         cfm_inline=args.cfm_inline,
         feature_max_concurrent=args.feature_max_concurrent,
         ar_batch_wait_sec=args.ar_batch_wait_sec,
+        ar_yield_every_steps=args.ar_yield_every_steps,
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,

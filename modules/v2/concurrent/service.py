@@ -201,6 +201,7 @@ class ARScheduler:
         compile_sampling: bool = False,
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
         batch_wait_sec: float = 0.0,
+        yield_every_steps: int = 1,
         feature_inflight_getter: Optional[Callable[[], int]] = None,
     ):
         self.ar_wrapper = ar_wrapper
@@ -216,6 +217,8 @@ class ARScheduler:
         self.compile_decode_cudagraphs = bool(compile_decode_cudagraphs)
         self.compile_sampling = bool(compile_sampling and self.compile_decode_enabled)
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
+        self.yield_every_steps = max(1, int(yield_every_steps))
+        self._decode_steps_since_yield = 0
         self.feature_inflight_getter = feature_inflight_getter
         self._batch_wait_logged = False
         if self.compile_decode_cudagraphs and self._is_t4_device():
@@ -260,7 +263,7 @@ class ARScheduler:
             (
                 "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
                 "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s "
-                "batch_wait_sec=%.3f profiling=%s"
+                "batch_wait_sec=%.3f yield_every_steps=%s profiling=%s"
             ),
             self.max_slots,
             self.max_seq_len,
@@ -271,6 +274,7 @@ class ARScheduler:
             self.compile_decode_cudagraphs,
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
             self.batch_wait_sec,
+            self.yield_every_steps,
             self.enable_profiling,
         )
 
@@ -534,6 +538,13 @@ class ARScheduler:
                 decode_requests = [request for request in self.active if request.is_prefilled]
                 if decode_requests:
                     self._decode_one_step(decode_requests)
+                    self._decode_steps_since_yield += 1
+                    if (
+                        self._decode_steps_since_yield < self.yield_every_steps
+                        and self.active
+                    ):
+                        continue
+                    self._decode_steps_since_yield = 0
 
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
@@ -1718,6 +1729,7 @@ class ConcurrentVoiceConversionService:
         cfm_inline: bool = False,
         feature_max_concurrent: int = 1,
         ar_batch_wait_sec: float = 0.0,
+        ar_yield_every_steps: int = 1,
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
@@ -1740,6 +1752,7 @@ class ConcurrentVoiceConversionService:
             compile_decode_cudagraphs=compile_ar_cudagraphs,
             compile_sampling=compile_ar_sampling,
             batch_wait_sec=ar_batch_wait_sec,
+            yield_every_steps=ar_yield_every_steps,
             feature_inflight_getter=self._get_feature_inflight,
         )
         self.cfm_scheduler = CFMScheduler(
