@@ -1390,23 +1390,24 @@ class CFMScheduler:
                 jobs[0].params.anonymization_only,
             )
 
+        max_output_mel_len = max(output_mel_lens)
+        vc_mel_batch = vc_mels[:, :, target_mel_len:target_mel_len + max_output_mel_len].contiguous()
+        if len(set(output_mel_lens)) > 1:
+            frame_ids = torch.arange(max_output_mel_len, device=vc_mel_batch.device)
+            lens = torch.as_tensor(output_mel_lens, device=vc_mel_batch.device)
+            pad_mask = frame_ids.unsqueeze(0) >= lens.unsqueeze(1)
+            vc_mel_batch = vc_mel_batch.masked_fill(pad_mask.unsqueeze(1), 0)
+
+        vc_wave_batch = self.vc_wrapper.vocoder(vc_mel_batch)
+        if vc_wave_batch.dim() == 3:
+            vc_wave_batch = vc_wave_batch.squeeze(1)
+        elif vc_wave_batch.dim() == 1:
+            vc_wave_batch = vc_wave_batch.unsqueeze(0)
+
         results = []
-        overlap_wave_len = self.vc_wrapper.overlap_frame_len * self.vc_wrapper.hop_size
-        for index, job in enumerate(jobs):
-            vc_mel = vc_mels[index:index + 1, :, target_mel_len:original_lens[index]]
-            vc_wave = self.vc_wrapper.vocoder(vc_mel).squeeze()[None]
-            generated_wave_chunks = []
-            _, _, should_break, _, full_audio = self.vc_wrapper._stream_wave_chunks(
-                vc_wave,
-                0,
-                vc_mel,
-                overlap_wave_len,
-                generated_wave_chunks,
-                None,
-                True,
-                stream_output=False,
-            )
-            waveform = full_audio if should_break else np.concatenate(generated_wave_chunks)
+        for index, output_mel_len in enumerate(output_mel_lens):
+            wave_len = int(output_mel_len) * int(self.vc_wrapper.hop_size)
+            waveform = vc_wave_batch[index, :wave_len].detach().cpu().numpy()
             results.append((self.vc_wrapper.sr, waveform))
 
         if self.enable_profiling:
