@@ -644,6 +644,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Experimental: compile AR sampling; disabled by default due dynamic-shape recompilation risk",
     )
+    parser.add_argument(
+        "--compile-ar-mode",
+        choices=("default", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune"),
+        default=None,
+        help="Optional torch.compile mode for AR decode; omitted preserves the current mode selection",
+    )
     parser.add_argument("--compile-cfm", action="store_true")
     parser.add_argument(
         "--compile-cfm-cudagraphs",
@@ -685,6 +691,7 @@ async def initialize_service(args) -> None:
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
+        compile_ar_mode=args.compile_ar_mode,
         compile_ar_sampling=args.compile_ar_sampling,
     )
     warmed_ar_batches = await service.warmup_ar_decode()

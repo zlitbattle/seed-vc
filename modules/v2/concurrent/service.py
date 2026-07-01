@@ -199,6 +199,7 @@ class ARScheduler:
         enable_profiling: bool = False,
         compile_decode: bool = False,
         compile_decode_cudagraphs: bool = False,
+        compile_decode_mode: Optional[str] = None,
         compile_sampling: bool = False,
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
         batch_wait_sec: float = 0.0,
@@ -217,6 +218,7 @@ class ARScheduler:
         self.compile_decode_requested = bool(compile_decode)
         self.compile_decode_enabled = bool(compile_decode and device.type == "cuda" and hasattr(torch, "compile"))
         self.compile_decode_cudagraphs = bool(compile_decode_cudagraphs)
+        self.compile_decode_mode = compile_decode_mode
         self.compile_sampling = bool(compile_sampling and self.compile_decode_enabled)
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
         self.yield_every_steps = max(1, int(yield_every_steps))
@@ -328,8 +330,13 @@ class ARScheduler:
             "fullgraph": True,
             "backend": "inductor",
         }
-        if self.compile_decode_cudagraphs:
-            compile_kwargs["mode"] = "reduce-overhead"
+        selected_mode = self.compile_decode_mode
+        if selected_mode == "default":
+            selected_mode = None
+        if selected_mode is None and self.compile_decode_cudagraphs:
+            selected_mode = "reduce-overhead"
+        if selected_mode is not None:
+            compile_kwargs["mode"] = selected_mode
         else:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
         logger.info(
@@ -1775,6 +1782,7 @@ class ConcurrentVoiceConversionService:
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
+        compile_ar_mode: Optional[str] = None,
         compile_ar_sampling: bool = False,
     ):
         self.vc_wrapper = vc_wrapper
@@ -1792,6 +1800,7 @@ class ConcurrentVoiceConversionService:
             enable_profiling=enable_profiling,
             compile_decode=compile_ar,
             compile_decode_cudagraphs=compile_ar_cudagraphs,
+            compile_decode_mode=compile_ar_mode,
             compile_sampling=compile_ar_sampling,
             batch_wait_sec=ar_batch_wait_sec,
             yield_every_steps=ar_yield_every_steps,
