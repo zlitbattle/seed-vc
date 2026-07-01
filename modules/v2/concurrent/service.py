@@ -81,6 +81,7 @@ class ARGenerateRequest:
     generated_tokens: List[torch.Tensor] = field(default_factory=list)
     generated_token_buffer: Optional[torch.Tensor] = None
     generated_token_count: int = 0
+    last_eos_check_token_count: int = 0
     previous_token_mask: Optional[torch.Tensor] = None
     queued_at: float = field(default_factory=time.perf_counter)
     activated_at: float = 0.0
@@ -202,6 +203,7 @@ class ARScheduler:
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
         batch_wait_sec: float = 0.0,
         yield_every_steps: int = 1,
+        eos_check_interval: int = 1,
         feature_inflight_getter: Optional[Callable[[], int]] = None,
     ):
         self.ar_wrapper = ar_wrapper
@@ -218,6 +220,7 @@ class ARScheduler:
         self.compile_sampling = bool(compile_sampling and self.compile_decode_enabled)
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
         self.yield_every_steps = max(1, int(yield_every_steps))
+        self.eos_check_interval = max(1, int(eos_check_interval))
         self._decode_steps_since_yield = 0
         self.feature_inflight_getter = feature_inflight_getter
         self._batch_wait_logged = False
@@ -263,7 +266,7 @@ class ARScheduler:
             (
                 "stage=ar_scheduler_config max_slots=%s max_seq_len=%s device=%s dtype=%s "
                 "compile_requested=%s compile_enabled=%s compile_cudagraphs=%s compile_batches=%s "
-                "batch_wait_sec=%.3f yield_every_steps=%s profiling=%s"
+                "batch_wait_sec=%.3f yield_every_steps=%s eos_check_interval=%s profiling=%s"
             ),
             self.max_slots,
             self.max_seq_len,
@@ -275,6 +278,7 @@ class ARScheduler:
             ",".join(str(batch_size) for batch_size in self.compile_batch_sizes) or "none",
             self.batch_wait_sec,
             self.yield_every_steps,
+            self.eos_check_interval,
             self.enable_profiling,
         )
 
@@ -611,6 +615,24 @@ class ARScheduler:
             self._batch_wait_logged = False
         return should_wait
 
+    def _finish_if_eos_seen(self, request: ARGenerateRequest, eos_token: int) -> bool:
+        if request.generated_token_buffer is None:
+            return False
+        start = int(request.last_eos_check_token_count)
+        end = int(request.generated_token_count)
+        if end <= start:
+            return False
+
+        eos_matches = request.generated_token_buffer[start:end] == int(eos_token)
+        if not bool(eos_matches.any().detach().cpu()):
+            request.last_eos_check_token_count = end
+            return False
+
+        first_eos_offset = int(torch.argmax(eos_matches.to(dtype=torch.int64)).detach().cpu())
+        request.generated_token_count = start + first_eos_offset
+        self._finish(request, reason="eos")
+        return True
+
     @torch.no_grad()
     def _prefill_one(self, request: ARGenerateRequest) -> None:
         assert request.slot_id is not None
@@ -648,6 +670,7 @@ class ARScheduler:
         )
         request.generated_token_buffer[0] = token.long()
         request.generated_token_count = 1
+        request.last_eos_check_token_count = 1
         request.previous_token_mask = torch.zeros(
             (int(self.ar_wrapper.model.config.vocab_size),),
             device=token.device,
@@ -858,17 +881,28 @@ class ARScheduler:
                     request.eager_decode_steps += 1
 
             next_tokens = next_tokens[:len(group)]
-            next_token_values = next_tokens.detach().cpu().tolist()
             embed_requests: List[ARGenerateRequest] = []
             embed_tokens: List[torch.Tensor] = []
-            for request, token, token_value in zip(group, next_tokens, next_token_values):
+            for request, token in zip(group, next_tokens):
                 token = token.reshape(()).clone()
-                reached_eos = int(token_value) == eos_token and request.generated_token_count >= self.min_tokens_before_eos
                 reached_limit = request.generated_token_count + 1 >= self.max_new_tokens
                 reached_cache_limit = request.next_kv_pos_value + 1 >= self.max_seq_len
-                if reached_eos or reached_limit or reached_cache_limit:
-                    reason = "eos" if reached_eos else "max_new_tokens" if reached_limit else "cache_limit"
-                    self._finish(request, reason=reason)
+                if self.eos_check_interval <= 1:
+                    token_value = int(token.detach().cpu())
+                    reached_eos = token_value == eos_token and request.generated_token_count >= self.min_tokens_before_eos
+                    if reached_eos or reached_limit or reached_cache_limit:
+                        reason = "eos" if reached_eos else "max_new_tokens" if reached_limit else "cache_limit"
+                        self._finish(request, reason=reason)
+                        continue
+                elif reached_limit or reached_cache_limit:
+                    token_value = int(token.detach().cpu())
+                    reached_eos = token_value == eos_token and request.generated_token_count >= self.min_tokens_before_eos
+                    if reached_eos:
+                        self._finish(request, reason="eos")
+                    elif self._finish_if_eos_seen(request, eos_token):
+                        pass
+                    else:
+                        self._finish(request, reason="max_new_tokens" if reached_limit else "cache_limit")
                     continue
 
                 if request.generated_token_buffer is None:
@@ -883,6 +917,13 @@ class ARScheduler:
                     request.next_input_pos.add_(1)
                 if request.next_kv_pos is not None:
                     request.next_kv_pos.add_(1)
+                if (
+                    self.eos_check_interval > 1
+                    and request.generated_token_count >= self.min_tokens_before_eos
+                    and request.generated_token_count - request.last_eos_check_token_count >= self.eos_check_interval
+                    and self._finish_if_eos_seen(request, eos_token)
+                ):
+                    continue
                 embed_requests.append(request)
                 embed_tokens.append(token)
 
@@ -1730,6 +1771,7 @@ class ConcurrentVoiceConversionService:
         feature_max_concurrent: int = 1,
         ar_batch_wait_sec: float = 0.0,
         ar_yield_every_steps: int = 1,
+        ar_eos_check_interval: int = 1,
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
@@ -1753,6 +1795,7 @@ class ConcurrentVoiceConversionService:
             compile_sampling=compile_ar_sampling,
             batch_wait_sec=ar_batch_wait_sec,
             yield_every_steps=ar_yield_every_steps,
+            eos_check_interval=ar_eos_check_interval,
             feature_inflight_getter=self._get_feature_inflight,
         )
         self.cfm_scheduler = CFMScheduler(

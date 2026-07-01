@@ -624,6 +624,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Yield the asyncio loop every N AR decode steps; 1 preserves the original scheduler behavior",
     )
+    parser.add_argument(
+        "--ar-eos-check-interval",
+        type=int,
+        default=1,
+        help="Check AR EOS every N decode steps; 1 preserves exact per-token EOS checking",
+    )
     parser.add_argument("--compile-ar", action="store_true")
     parser.add_argument(
         "--compile-ar-cudagraphs",
@@ -666,6 +672,7 @@ async def initialize_service(args) -> None:
         feature_max_concurrent=args.feature_max_concurrent,
         ar_batch_wait_sec=args.ar_batch_wait_sec,
         ar_yield_every_steps=args.ar_yield_every_steps,
+        ar_eos_check_interval=args.ar_eos_check_interval,
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
