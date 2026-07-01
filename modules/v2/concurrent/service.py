@@ -229,7 +229,7 @@ class ARScheduler:
             if 1 <= int(batch_size) <= max_slots
         }))
         self.compiled_decode_fns: Dict[int, Callable] = {}
-        self.compiled_sample_fn: Optional[Callable] = None
+        self.compiled_sample_fns: Dict[int, Callable] = {}
         self.compile_failures = 0
         self.compile_fallbacks = 0
         self.sample_compile_failures = 0
@@ -249,12 +249,12 @@ class ARScheduler:
         if self.compile_decode_enabled:
             self._build_compiled_decode_fns()
             if self.compile_sampling:
-                self._build_compiled_sample_fn()
+                self._build_compiled_sample_fns()
             logger.info(
-                "stage=ar_compile_enabled batches=%s max_slots=%s sample_compiled=%s",
+                "stage=ar_compile_enabled batches=%s max_slots=%s sample_compiled_batches=%s",
                 ",".join(str(batch_size) for batch_size in self.compiled_decode_fns),
                 self.max_slots,
-                self.compiled_sample_fn is not None,
+                ",".join(str(batch_size) for batch_size in sorted(self.compiled_sample_fns)) or "none",
             )
         logger.info(
             (
@@ -347,9 +347,9 @@ class ARScheduler:
                 **compile_kwargs,
             )
 
-    def _build_compiled_sample_fn(self) -> None:
+    def _build_compiled_sample_fns(self) -> None:
+        self.compiled_sample_fns.clear()
         if not self.compile_decode_enabled or not self.compile_sampling:
-            self.compiled_sample_fn = None
             return
 
         eos_token = int(self.ar_wrapper.model.config.vocab_size - 1)
@@ -390,7 +390,8 @@ class ARScheduler:
             compile_kwargs["mode"] = "reduce-overhead"
         else:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
-        self.compiled_sample_fn = torch.compile(sample_forward, **compile_kwargs)
+        for batch_size in range(1, self.max_slots + 1):
+            self.compiled_sample_fns[batch_size] = torch.compile(sample_forward, **compile_kwargs)
 
     @torch.no_grad()
     def warmup_compiled_decode(self) -> List[int]:
@@ -432,10 +433,9 @@ class ARScheduler:
                     exc,
                 )
 
-        if self.compiled_sample_fn is not None:
+        for sample_batch_size, compiled_sample_fn in list(self.compiled_sample_fns.items()):
             started_at = time.perf_counter()
             vocab_size = int(self.ar_wrapper.model.config.vocab_size)
-            sample_batch_size = max(self.compiled_decode_fns) if self.compiled_decode_fns else 1
             logits = torch.zeros(
                 (sample_batch_size, vocab_size),
                 device=self.device,
@@ -453,7 +453,7 @@ class ARScheduler:
             try:
                 logger.info("stage=warmup_ar_sample_start batch_size=%s", sample_batch_size)
                 with self._autocast_context():
-                    sampled = self.compiled_sample_fn(
+                    sampled = compiled_sample_fn(
                         logits,
                         previous_token_mask,
                         suppress_eos,
@@ -470,7 +470,7 @@ class ARScheduler:
                 )
             except Exception as exc:
                 self.sample_compile_failures += 1
-                self.compiled_sample_fn = None
+                self.compiled_sample_fns.pop(sample_batch_size, None)
                 logger.warning(
                     "stage=warmup_ar_sample_failed batch_size=%s error_type=%s error=%s",
                     sample_batch_size,
@@ -756,6 +756,7 @@ class ARScheduler:
                 repetition_penalty=repetition_penalty,
             )
 
+            compiled_sample_fn = self.compiled_sample_fns.get(active_count)
             profile_started_at = self._profile_start()
             with self._autocast_context():
                 try:
@@ -768,16 +769,16 @@ class ARScheduler:
                         previous_token_masks=previous_token_masks,
                         suppress_tokens=suppress_tokens,
                         compiled_decode_fn=compiled_decode_fn,
-                        compiled_sample_fn=self.compiled_sample_fn,
+                        compiled_sample_fn=compiled_sample_fn,
                         active_count=active_count,
                         top_p=top_p,
                         temperature=temperature,
                         repetition_penalty=repetition_penalty,
                     )
                 except Exception as exc:
-                    if self.compiled_sample_fn is not None:
+                    if compiled_sample_fn is not None:
                         self.sample_compile_fallbacks += 1
-                        self.compiled_sample_fn = None
+                        self.compiled_sample_fns.pop(active_count, None)
                         logger.warning(
                             (
                                 "stage=ar_sample_compile_fallback active_count=%s requests=%s "
@@ -1070,7 +1071,8 @@ class ARScheduler:
             "failed": self.failed,
             "compile_decode_enabled": int(self.compile_decode_enabled),
             "compiled_decode_batches": list(sorted(self.compiled_decode_fns)),
-            "compile_sample_enabled": int(self.compiled_sample_fn is not None),
+            "compile_sample_enabled": int(bool(self.compiled_sample_fns)),
+            "compiled_sample_batches": list(sorted(self.compiled_sample_fns)),
             "compile_failures": self.compile_failures,
             "compile_fallbacks": self.compile_fallbacks,
             "sample_compile_failures": self.sample_compile_failures,
