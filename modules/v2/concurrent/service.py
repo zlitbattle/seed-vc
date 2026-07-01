@@ -198,6 +198,7 @@ class ARScheduler:
         enable_profiling: bool = False,
         compile_decode: bool = False,
         compile_decode_cudagraphs: bool = False,
+        compile_sampling: bool = False,
         compile_batch_sizes: Sequence[int] = (1, 2, 4),
         batch_wait_sec: float = 0.0,
         feature_inflight_getter: Optional[Callable[[], int]] = None,
@@ -213,6 +214,7 @@ class ARScheduler:
         self.compile_decode_requested = bool(compile_decode)
         self.compile_decode_enabled = bool(compile_decode and device.type == "cuda" and hasattr(torch, "compile"))
         self.compile_decode_cudagraphs = bool(compile_decode_cudagraphs)
+        self.compile_sampling = bool(compile_sampling and self.compile_decode_enabled)
         self.batch_wait_sec = max(0.0, float(batch_wait_sec))
         self.feature_inflight_getter = feature_inflight_getter
         self._batch_wait_logged = False
@@ -246,7 +248,8 @@ class ARScheduler:
             )
         if self.compile_decode_enabled:
             self._build_compiled_decode_fns()
-            self._build_compiled_sample_fn()
+            if self.compile_sampling:
+                self._build_compiled_sample_fn()
             logger.info(
                 "stage=ar_compile_enabled batches=%s max_slots=%s sample_compiled=%s",
                 ",".join(str(batch_size) for batch_size in self.compiled_decode_fns),
@@ -345,7 +348,7 @@ class ARScheduler:
             )
 
     def _build_compiled_sample_fn(self) -> None:
-        if not self.compile_decode_enabled:
+        if not self.compile_decode_enabled or not self.compile_sampling:
             self.compiled_sample_fn = None
             return
 
@@ -1707,6 +1710,7 @@ class ConcurrentVoiceConversionService:
         enable_profiling: bool = False,
         compile_ar: bool = False,
         compile_ar_cudagraphs: bool = False,
+        compile_ar_sampling: bool = False,
     ):
         self.vc_wrapper = vc_wrapper
         self.device = device
@@ -1723,6 +1727,7 @@ class ConcurrentVoiceConversionService:
             enable_profiling=enable_profiling,
             compile_decode=compile_ar,
             compile_decode_cudagraphs=compile_ar_cudagraphs,
+            compile_sampling=compile_ar_sampling,
             batch_wait_sec=ar_batch_wait_sec,
             feature_inflight_getter=self._get_feature_inflight,
         )

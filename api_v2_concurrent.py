@@ -619,6 +619,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Experimental: use torch.compile reduce-overhead/CUDA Graphs for AR decode",
     )
+    parser.add_argument(
+        "--compile-ar-sampling",
+        action="store_true",
+        help="Experimental: compile AR sampling; disabled by default due dynamic-shape recompilation risk",
+    )
     parser.add_argument("--compile-cfm", action="store_true")
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")
@@ -646,6 +651,7 @@ async def initialize_service(args) -> None:
         enable_profiling=args.enable_profiling,
         compile_ar=args.compile_ar or args.compile_ar_cudagraphs,
         compile_ar_cudagraphs=args.compile_ar_cudagraphs,
+        compile_ar_sampling=args.compile_ar_sampling,
     )
     warmed_ar_batches = await service.warmup_ar_decode()
     if warmed_ar_batches:
