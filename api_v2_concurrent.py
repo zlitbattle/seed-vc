@@ -530,10 +530,10 @@ def load_v2_models(args, device: torch.device, dtype: torch.dtype):
             args.ar_slots,
             FIXED_AR_SLOTS,
         )
-    if args.compile_ar or args.compile_ar_cudagraphs or args.compile_cfm:
+    if args.compile_ar or args.compile_ar_cudagraphs or args.compile_cfm or args.compile_cfm_cudagraphs:
         configure_torch_compile()
-    if args.compile_cfm:
-        vc_wrapper.compile_cfm()
+    if args.compile_cfm or args.compile_cfm_cudagraphs:
+        vc_wrapper.compile_cfm(use_cudagraphs=args.compile_cfm_cudagraphs)
     return vc_wrapper
 
 
@@ -625,6 +625,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Experimental: compile AR sampling; disabled by default due dynamic-shape recompilation risk",
     )
     parser.add_argument("--compile-cfm", action="store_true")
+    parser.add_argument(
+        "--compile-cfm-cudagraphs",
+        action="store_true",
+        help="Experimental: use torch.compile reduce-overhead/CUDA Graphs for CFM",
+    )
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling logs and CUDA sync timing")
     parser.add_argument("--colab", action="store_true", help="Start a Cloudflare tunnel and print a public URL")
     return parser
